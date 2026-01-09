@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
+import os
+import re
 import sys
 import json
 import shlex
+import argparse
 import subprocess
 import http.client
-import argparse
+import urllib.error
+import urllib.request
+from html.parser import HTMLParser
 
 USAGE = """Usage: opx.py [options] <prompt>
 Options:
@@ -18,7 +23,7 @@ Options:
 """
 
 SYSTEM_PROMPT = (
-    "Be a mighty Linux system operator. Use short answers. If code or commands are requested, output only code."
+    "You are a mighty Linux system operator. Make short answers. If code is requested, output only code."
 )
 
 def usage(exit_code=0, err=False):
@@ -94,34 +99,49 @@ class CodeFilter:
         if self.in_code and self.bt_count and not self.skip_lang: self._write("`" * self.bt_count)
         self.bt_count = 0
 
-def read_extra(input_fh):
-    if input_fh: return input_fh.read()
-    if not sys.stdin.isatty(): return sys.stdin.read()
-    return ""
-
-def build_prompt(prompt, extra):
-    if extra: return f"{prompt}\n\n```\n{extra}\n```"
-    return prompt
-
-def send_request(host, port, body):
+def request_response(host, port, body):
     conn = http.client.HTTPConnection(host, int(port), timeout=60)
     try:
         conn.request("POST", "/v1/chat/completions", body=body, headers={"Content-Type": "application/json"})
         resp = conn.getresponse()
+        if resp is None or resp.status < 200 or resp.status >= 300:
+            sys.stderr.write("Network error\n")
+            sys.exit(1)
+        return resp
     except (OSError, http.client.HTTPException):
         conn.close()
-        return None, "Network error"
-    return resp, None
-
-def request_response(host, port, body):
-    resp, err = send_request(host, port, body)
-    if err:
-        sys.stderr.write(err + "\n")
-        sys.exit(1)
-    if resp is None or resp.status < 200 or resp.status >= 300:
         sys.stderr.write("Network error\n")
         sys.exit(1)
-    return resp
+
+def _ollama_request(host, port, method, path, body=None):
+    conn = http.client.HTTPConnection(host, int(port), timeout=60)
+    try:
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        if resp is None or resp.status < 200 or resp.status >= 300:
+            return None, None
+        return resp, resp.read()
+    except (OSError, http.client.HTTPException):
+        return None, None
+    finally:
+        conn.close()
+
+def ensure_model_available(host, port, model):
+    resp, data = _ollama_request(host, port, "GET", "/api/tags")
+    if not resp or not data: return
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return
+    models = payload.get("models") or []
+    if any(m.get("name") == model for m in models):
+        return
+    pull_body = json.dumps({"name": model, "stream": False})
+    resp, _ = _ollama_request(host, port, "POST", "/api/pull", pull_body)
+    if not resp:
+        sys.stderr.write(f"Failed to pull model: {model}\n")
+        sys.exit(1)
 
 def run_bash_tool(command):
     if not command: return {"tool": "bash", "exit_code": 1, "stdout": "", "stderr": "Empty command"}
@@ -150,6 +170,216 @@ def run_bash_tool(command):
         "stderr": completed.stderr,
     }
 
+def run_edit_tool(diff_text):
+    if not diff_text: return {"tool": "edit", "exit_code": 1, "stdout": "", "stderr": "Empty diff"}
+    sys.stderr.write("Tool request (edit), diff:\n")
+    sys.stderr.write(diff_text)
+    if not diff_text.endswith("\n"): sys.stderr.write("\n")
+    sys.stderr.write("Approve? [Y/n]: ")
+    sys.stderr.flush()
+    resp = sys.stdin.readline()
+    if resp and resp.strip().lower() not in ["", "y", "yes"]:
+        return {"tool": "edit", "exit_code": 1, "stdout": "", "stderr": "Rejected by user"}
+    try:
+        completed = subprocess.run(
+            ["patch", "-p0", "--forward"],
+            input=diff_text,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return {"tool": "edit", "exit_code": 1, "stdout": "", "stderr": str(exc)}
+    return {
+        "tool": "edit",
+        "exit_code": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+def run_write_tool(path, content):
+    if not path: return {"tool": "write", "exit_code": 1, "stdout": "", "stderr": "Missing path"}
+    if content is None: return {"tool": "write", "exit_code": 1, "stdout": "", "stderr": "Missing content"}
+    sys.stderr.write("Tool request (write), path:\n")
+    sys.stderr.write(f"{path}\n")
+    sys.stderr.write("Content:\n")
+    sys.stderr.write(content)
+    if not content.endswith("\n"): sys.stderr.write("\n")
+    sys.stderr.write("Approve? [Y/n]: ")
+    sys.stderr.flush()
+    resp = sys.stdin.readline()
+    if resp and resp.strip().lower() not in ["", "y", "yes"]:
+        return {"tool": "write", "exit_code": 1, "stdout": "", "stderr": "Rejected by user"}
+    try:
+        with open(path, "x", encoding="utf-8") as f:
+            f.write(content)
+    except FileExistsError:
+        return {"tool": "write", "exit_code": 1, "stdout": "", "stderr": "File already exists"}
+    except OSError as exc:
+        return {"tool": "write", "exit_code": 1, "stdout": "", "stderr": str(exc)}
+    return {"tool": "write", "exit_code": 0, "stdout": "OK\n", "stderr": ""}
+
+def run_read_tool(path):
+    if not path: return {"tool": "read", "exit_code": 1, "stdout": "", "stderr": "Missing path"}
+    sys.stderr.write("Tool request (read), path:\n")
+    sys.stderr.write(f"{path}\n")
+    sys.stderr.write("Approve? [Y/n]: ")
+    sys.stderr.flush()
+    resp = sys.stdin.readline()
+    if resp and resp.strip().lower() not in ["", "y", "yes"]:
+        return {"tool": "read", "exit_code": 1, "stdout": "", "stderr": "Rejected by user"}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = f.read()
+    except OSError as exc:
+        return {"tool": "read", "exit_code": 1, "stdout": "", "stderr": str(exc)}
+    return {"tool": "read", "exit_code": 0, "stdout": data, "stderr": ""}
+
+def run_list_tool(path):
+    if not path: return {"tool": "list", "exit_code": 1, "stdout": "", "stderr": "Missing path"}
+    sys.stderr.write("Tool request (list), path:\n")
+    sys.stderr.write(f"{path}\n")
+    sys.stderr.write("Approve? [Y/n]: ")
+    sys.stderr.flush()
+    resp = sys.stdin.readline()
+    if resp and resp.strip().lower() not in ["", "y", "yes"]:
+        return {"tool": "list", "exit_code": 1, "stdout": "", "stderr": "Rejected by user"}
+    try:
+        entries = os.listdir(path)
+    except OSError as exc:
+        return {"tool": "list", "exit_code": 1, "stdout": "", "stderr": str(exc)}
+    entries.sort()
+    return {"tool": "list", "exit_code": 0, "stdout": "\n".join(entries) + "\n", "stderr": ""}
+
+def run_mkdir_tool(path):
+    if not path: return {"tool": "mkdir", "exit_code": 1, "stdout": "", "stderr": "Missing path"}
+    sys.stderr.write("Tool request (mkdir), path:\n")
+    sys.stderr.write(f"{path}\n")
+    sys.stderr.write("Approve? [Y/n]: ")
+    sys.stderr.flush()
+    resp = sys.stdin.readline()
+    if resp and resp.strip().lower() not in ["", "y", "yes"]:
+        return {"tool": "mkdir", "exit_code": 1, "stdout": "", "stderr": "Rejected by user"}
+    try:
+        os.makedirs(path, exist_ok=False)
+    except FileExistsError:
+        return {"tool": "mkdir", "exit_code": 1, "stdout": "", "stderr": "Already exists"}
+    except OSError as exc:
+        return {"tool": "mkdir", "exit_code": 1, "stdout": "", "stderr": str(exc)}
+    return {"tool": "mkdir", "exit_code": 0, "stdout": "OK\n", "stderr": ""}
+
+class HTMLToMarkdown(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.out = []
+        self.in_pre = False
+        self.link_href = None
+        self.link_text = []
+
+    def _ensure_blankline(self):
+        if not self.out:
+            return
+        text = "".join(self.out)
+        if not text.endswith("\n\n"):
+            if text.endswith("\n"):
+                self.out.append("\n")
+            else:
+                self.out.append("\n\n")
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "p":
+            self._ensure_blankline()
+        elif tag == "br":
+            self.out.append("\n")
+        elif tag in ["strong", "b"]:
+            self.out.append("**")
+        elif tag in ["em", "i"]:
+            self.out.append("*")
+        elif tag == "code":
+            if not self.in_pre:
+                self.out.append("`")
+        elif tag == "pre":
+            self._ensure_blankline()
+            self.out.append("```\n")
+            self.in_pre = True
+        elif tag == "a":
+            self.link_href = None
+            self.link_text = []
+            for key, value in attrs:
+                if key == "href":
+                    self.link_href = value
+
+    def handle_endtag(self, tag):
+        if tag in ["strong", "b"]:
+            self.out.append("**")
+        elif tag in ["em", "i"]:
+            self.out.append("*")
+        elif tag == "code":
+            if not self.in_pre:
+                self.out.append("`")
+        elif tag == "pre":
+            if not "".join(self.out).endswith("\n"):
+                self.out.append("\n")
+            self.out.append("```\n")
+            self.in_pre = False
+        elif tag == "a":
+            text = "".join(self.link_text).strip()
+            href = self.link_href or ""
+            if text:
+                self.out.append(f"[{text}]({href})")
+            self.link_href = None
+            self.link_text = []
+
+    def handle_data(self, data):
+        if not data:
+            return
+        if self.in_pre:
+            self.out.append(data)
+            return
+        if self.link_href is not None:
+            self.link_text.append(data)
+        else:
+            self.out.append(re.sub(r"\s+", " ", data))
+
+    def get_markdown(self):
+        return "".join(self.out).strip() + "\n"
+
+def _parse_charset(content_type):
+    if not content_type: return None
+    match = re.search(r"charset=([^\s;]+)", content_type, re.IGNORECASE)
+    if match: return match.group(1).strip()
+    return None
+
+def _is_text_mime(content_type):
+    if not content_type: return False
+    mime = content_type.split(";", 1)[0].strip().lower()
+    return mime.startswith("text/")
+
+def run_internet_read_tool(url):
+    if not url: return {"tool": "internet_read", "exit_code": 1, "stdout": "", "stderr": "Missing url"}
+    sys.stderr.write("Tool request (internet_read), url:\n")
+    sys.stderr.write(f"{url}\n")
+    sys.stderr.write("Approve? [Y/n]: ")
+    sys.stderr.flush()
+    resp = sys.stdin.readline()
+    if resp and resp.strip().lower() not in ["", "y", "yes"]:
+        return {"tool": "internet_read", "exit_code": 1, "stdout": "", "stderr": "Rejected by user"}
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "opx/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            if not _is_text_mime(content_type):
+                return {"tool": "internet_read", "exit_code": 1, "stdout": "", "stderr": "Rejected: non-text mime type"}
+            raw = resp.read()
+    except urllib.error.URLError as exc:
+        return {"tool": "internet_read", "exit_code": 1, "stdout": "", "stderr": str(exc)}
+    charset = _parse_charset(content_type) or "utf-8"
+    text = raw.decode(charset, errors="replace")
+    if content_type.lower().startswith("text/html"):
+        parser = HTMLToMarkdown()
+        parser.feed(text)
+        text = parser.get_markdown()
+    return {"tool": "internet_read", "exit_code": 0, "stdout": text, "stderr": ""}
+
 def _emit_content(content, writer, code_filter):
     if not content: return
     if code_filter:
@@ -167,20 +397,16 @@ def process_response(resp, writer, code_only, stream):
     if stream:
         while True:
             line = resp.readline()
-            if not line:
-                break
-            if not line.startswith(b"data:"):
-                continue
+            if not line: break
+            if not line.startswith(b"data:"): continue
             data = line[5:].strip()
-            if data == b"[DONE]":
-                break
+            if data == b"[DONE]": break
             try:
                 payload = json.loads(data)
             except json.JSONDecodeError:
                 continue
             choices = payload.get("choices") or []
-            if not choices:
-                continue
+            if not choices: continue
             delta = choices[0].get("delta") or {}
             content = delta.get("content")
             _emit_content(content, writer, code_filter)
@@ -200,8 +426,7 @@ def process_response(resp, writer, code_only, stream):
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:
-            if code_filter:
-                code_filter.flush()
+            if code_filter: code_filter.flush()
             writer.flush()
             return None
         choices = payload.get("choices") or []
@@ -219,23 +444,43 @@ def process_response(resp, writer, code_only, stream):
     if code_filter: code_filter.flush()
     writer.flush()
     if tool_args and tool_name is None: tool_name = "bash"
-    if tool_name == "bash" and tool_args:
+    if tool_name in ["bash", "edit", "write", "read", "list", "mkdir", "internet_read"] and tool_args:
         try:
             args_obj = json.loads(tool_args)
         except json.JSONDecodeError:
             return None
-        command = args_obj.get("command")
-        if isinstance(command, str):
-            return {"id": tool_id, "name": tool_name, "command": command, "arguments": tool_args}
+        if tool_name == "bash":
+            command = args_obj.get("command")
+            if isinstance(command, str):
+                return {"id": tool_id, "name": tool_name, "command": command, "arguments": tool_args}
+        if tool_name == "edit":
+            diff_text = args_obj.get("diff")
+            if isinstance(diff_text, str):
+                return {"id": tool_id, "name": tool_name, "diff": diff_text, "arguments": tool_args}
+        if tool_name == "write":
+            path = args_obj.get("path")
+            content = args_obj.get("content")
+            if isinstance(path, str) and isinstance(content, str):
+                return {"id": tool_id, "name": tool_name, "path": path, "content": content, "arguments": tool_args}
+        if tool_name in ["read", "list", "mkdir"]:
+            path = args_obj.get("path")
+            if isinstance(path, str):
+                return {"id": tool_id, "name": tool_name, "path": path, "arguments": tool_args}
+        if tool_name == "internet_read":
+            url = args_obj.get("url")
+            if isinstance(url, str):
+                return {"id": tool_id, "name": tool_name, "url": url, "arguments": tool_args}
     return None
 
 def main():
     host, port, model, output_file, input_file, code_only, prompt = parse_args(sys.argv[1:])
     input_name = ""
     if input_file: input_name = input_file.name
-    extra = read_extra(input_file)
+    extra = ""
+    if input_file: extra = input_file.read()
+    if not sys.stdin.isatty(): extra = sys.stdin.read()
     if input_file: input_file.close()
-    prompt = build_prompt(prompt, extra)
+    if extra: prompt = f"{prompt}\n\n```\n{extra}\n```"
 
     output_path = ""
     if output_file:
@@ -246,6 +491,7 @@ def main():
         output_path = input_name
 
     stream = output_path == ""
+    ensure_model_available(host, port, model)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
@@ -269,6 +515,122 @@ def main():
                 "strict": True,
             },
         }
+        ,
+        {
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "description": "Apply a unified diff to edit files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "diff": {
+                            "type": "string",
+                            "description": "Unified diff of the file edits to apply.",
+                        }
+                    },
+                    "required": ["diff"], "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        }
+        ,
+        {
+            "type": "function",
+            "function": {
+                "name": "write",
+                "description": "Create a new file with provided content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the new file (must not already exist).",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Full content of the new file.",
+                        },
+                    },
+                    "required": ["path", "content"], "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        }
+        ,
+        {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read a text file and return its contents.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to a text file to read.",
+                        }
+                    },
+                    "required": ["path"], "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list",
+                "description": "List directory entries.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory path to list.",
+                        }
+                    },
+                    "required": ["path"], "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "mkdir",
+                "description": "Create a new directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory path to create.",
+                        }
+                    },
+                    "required": ["path"], "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        }
+        ,
+        {
+            "type": "function",
+            "function": {
+                "name": "internet_read",
+                "description": "Read a text resource from a URL; HTML is converted to Markdown.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "URL to fetch (text/* only).",
+                        }
+                    },
+                    "required": ["url"], "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        }
     ]
 
     while True:
@@ -282,11 +644,34 @@ def main():
             tool_request = process_response(resp, sys.stdout, code_only, stream)
 
         if tool_request:
-            tool_result = run_bash_tool(tool_request.get("command", ""))
+            if tool_request.get("name") == "edit":
+                tool_result = run_edit_tool(tool_request.get("diff", ""))
+                tool_name = "edit"
+            elif tool_request.get("name") == "write":
+                tool_result = run_write_tool(
+                    tool_request.get("path", ""),
+                    tool_request.get("content", ""),
+                )
+                tool_name = "write"
+            elif tool_request.get("name") == "read":
+                tool_result = run_read_tool(tool_request.get("path", ""))
+                tool_name = "read"
+            elif tool_request.get("name") == "list":
+                tool_result = run_list_tool(tool_request.get("path", ""))
+                tool_name = "list"
+            elif tool_request.get("name") == "mkdir":
+                tool_result = run_mkdir_tool(tool_request.get("path", ""))
+                tool_name = "mkdir"
+            elif tool_request.get("name") == "internet_read":
+                tool_result = run_internet_read_tool(tool_request.get("url", ""))
+                tool_name = "internet_read"
+            else:
+                tool_result = run_bash_tool(tool_request.get("command", ""))
+                tool_name = "bash"
             tool_call = {
                 "id": tool_request.get("id") or "call_1",
                 "type": "function",
-                "function": {"name": "bash", "arguments": tool_request.get("arguments", "")},
+                "function": {"name": tool_name, "arguments": tool_request.get("arguments", "")},
             }
             messages.append({"role": "assistant", "tool_calls": [tool_call]})
             tool_msg = {"role": "tool", "content": json.dumps(tool_result)}
