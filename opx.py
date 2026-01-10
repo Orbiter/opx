@@ -166,29 +166,141 @@ def request_tool_approval(subject, write_request):
         return True
     return resp in ["Y", "y", "yes"]
 
-def run_bash_tool(command):
-    if not command:
-        return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Empty command", "data": {}, "message": "Empty command"}
-    forbidden = ["|", ";", "&", ">", "<", "\n", "\r"]
-    rejectedmsg = "Rejected by user, try a different approach"
-    if any(token in command for token in forbidden):
-        return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected: unsafe command, try a safe approach", "data": {}, "message": "Rejected: unsafe command, try a safe approach"}
-    if not request_tool_approval(f"bash: {command}", write_request=True):
-        return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": rejectedmsg, "data": {}, "message": rejectedmsg}
+def _load_tool_args(arguments):
+    if not arguments:
+        return None
     try:
-        args = shlex.split(command)
-    except ValueError as exc:
-        return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
-    if not args:
-        return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Empty command", "data": {}, "message": "Empty command"}
-    try:
-        completed = subprocess.run(args, capture_output=True, text=True)
-    except OSError as exc:
-        return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
-    return {"tool": "bash", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"command": command, "args": args}}
+        return json.loads(arguments)
+    except json.JSONDecodeError:
+        return None
 
-def run_edit_tool(diff_text):
-    def _count_files_changed(diff_body):
+def _path_tool_description(name, description):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to target.",
+                    }
+                },
+                "required": ["path"], "additionalProperties": False,
+            },
+            "strict": True,
+        },
+    }
+
+class BaseTool:
+    name = ""
+
+    def describe(self):
+        raise NotImplementedError
+
+    def argument_spec(self):
+        return {}
+
+    def parse_arguments(self, arguments):
+        args = _load_tool_args(arguments)
+        if not isinstance(args, dict):
+            return None
+        spec = self.argument_spec()
+        if not spec:
+            return {}
+        parsed = {}
+        for key, expected_type in spec.items():
+            value = args.get(key)
+            if expected_type is str:
+                if not isinstance(value, str):
+                    return None
+            elif not isinstance(value, expected_type):
+                return None
+            parsed[key] = value
+        return parsed
+
+    def handle(self, **kwargs):
+        raise NotImplementedError
+
+    def handle_request(self, tool_request):
+        return self.handle(**tool_request)
+
+class BashTool(BaseTool):
+    name = "bash"
+
+    def argument_spec(self):
+        return {"command": str}
+
+    def describe(self):
+        return {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run a single shell command and return stdout/stderr.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Single shell command (no pipes or redirection).",
+                        }
+                    },
+                    "required": ["command"], "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        }
+
+    def handle(self, command=None, **_):
+        if not command:
+            return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Empty command", "data": {}, "message": "Empty command"}
+        forbidden = ["|", ";", "&", ">", "<", "\n", "\r"]
+        rejectedmsg = "Rejected by user, try a different approach"
+        if any(token in command for token in forbidden):
+            return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected: unsafe command, try a safe approach", "data": {}, "message": "Rejected: unsafe command, try a safe approach"}
+        if not request_tool_approval(f"bash: {command}", write_request=True):
+            return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": rejectedmsg, "data": {}, "message": rejectedmsg}
+        try:
+            args = shlex.split(command)
+        except ValueError as exc:
+            return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+        if not args:
+            return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Empty command", "data": {}, "message": "Empty command"}
+        try:
+            completed = subprocess.run(args, capture_output=True, text=True)
+        except OSError as exc:
+            return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+        return {"tool": "bash", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"command": command, "args": args}}
+
+class EditTool(BaseTool):
+    name = "edit"
+
+    def argument_spec(self):
+        return {"diff": str}
+
+    def describe(self):
+        return {
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "description": "Apply a unified diff to edit files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "diff": {
+                            "type": "string",
+                            "description": "Unified diff of the file edits to apply.",
+                        }
+                    },
+                    "required": ["diff"], "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        }
+
+    def _count_files_changed(self, diff_body):
         files = set()
         for line in diff_body.splitlines():
             if line.startswith("+++ "):
@@ -197,70 +309,157 @@ def run_edit_tool(diff_text):
                     files.add(path)
         return len(files)
 
-    if not diff_text: return {"tool": "edit", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Empty diff", "data": {"applied": False, "files_changed": 0}, "message": "Empty diff"}
-    sys.stderr.write("Tool request (edit), diff:\n")
-    sys.stderr.write(diff_text)
-    if not diff_text.endswith("\n"): sys.stderr.write("\n")
-    if not request_tool_approval(diff_text, write_request=True): return {"tool": "edit", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {"applied": False, "files_changed": 0}, "message": "Rejected by user"}
-    try:
-        completed = subprocess.run(
-            ["patch", "-p0", "--forward"],
-            input=diff_text,
-            capture_output=True,
-            text=True,
+    def handle(self, diff=None, **_):
+        if not diff:
+            return {"tool": "edit", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Empty diff", "data": {"applied": False, "files_changed": 0}, "message": "Empty diff"}
+        sys.stderr.write("Tool request (edit), diff:\n")
+        sys.stderr.write(diff)
+        if not diff.endswith("\n"):
+            sys.stderr.write("\n")
+        if not request_tool_approval(diff, write_request=True):
+            return {"tool": "edit", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {"applied": False, "files_changed": 0}, "message": "Rejected by user"}
+        try:
+            completed = subprocess.run(
+                ["patch", "-p0", "--forward"],
+                input=diff,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            return {"tool": "edit", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {"applied": False, "files_changed": 0}, "message": str(exc)}
+        files_changed = self._count_files_changed(diff)
+        return {"tool": "edit", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"applied": completed.returncode == 0, "files_changed": files_changed}}
+
+class WriteTool(BaseTool):
+    name = "write"
+
+    def argument_spec(self):
+        return {"path": str, "content": str}
+
+    def describe(self):
+        return {
+            "type": "function",
+            "function": {
+                "name": "write",
+                "description": "Create a new file with provided content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the new file (must not already exist).",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Full content of the new file.",
+                        },
+                    },
+                    "required": ["path", "content"], "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        }
+
+    def handle(self, path=None, content=None, **_):
+        if not path:
+            return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
+        if content is None:
+            return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing content", "data": {}, "message": "Missing content"}
+        sys.stderr.write("Tool request (write), path:\n")
+        sys.stderr.write(f"{path}\n")
+        sys.stderr.write("Content:\n")
+        sys.stderr.write(content)
+        if not content.endswith("\n"):
+            sys.stderr.write("\n")
+        if not request_tool_approval(f"write to: {path}", write_request=True):
+            return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+        try:
+            with open(path, "x", encoding="utf-8") as f:
+                f.write(content)
+        except FileExistsError:
+            return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "File already exists", "data": {}, "message": "File already exists"}
+        except OSError as exc:
+            return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+        return {"tool": "write", "ok": True, "exit_code": 0, "stdout": "OK\n", "stderr": "", "data": {"path": path, "bytes": len(content.encode("utf-8"))}}
+
+class ReadTool(BaseTool):
+    name = "read"
+
+    def argument_spec(self):
+        return {"path": str}
+
+    def describe(self):
+        return _path_tool_description(
+            "read",
+            "Read a text file and return its contents.",
         )
-    except OSError as exc: return {"tool": "edit", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {"applied": False, "files_changed": 0}, "message": str(exc)}
-    files_changed = _count_files_changed(diff_text)
-    return {"tool": "edit", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"applied": completed.returncode == 0, "files_changed": files_changed}}
 
-def run_write_tool(path, content):
-    if not path: return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
-    if content is None: return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing content", "data": {}, "message": "Missing content"}
-    sys.stderr.write("Tool request (write), path:\n")
-    sys.stderr.write(f"{path}\n")
-    sys.stderr.write("Content:\n")
-    sys.stderr.write(content)
-    if not content.endswith("\n"): sys.stderr.write("\n")
-    if not request_tool_approval(f"write to: {path}", write_request=True): return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
-    try:
-        with open(path, "x", encoding="utf-8") as f:
-            f.write(content)
-    except FileExistsError: return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "File already exists", "data": {}, "message": "File already exists"}
-    except OSError as exc: return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
-    return {"tool": "write", "ok": True, "exit_code": 0, "stdout": "OK\n", "stderr": "", "data": {"path": path, "bytes": len(content.encode("utf-8"))}}
+    def handle(self, path=None, **_):
+        if not path:
+            return {"tool": "read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
+        sys.stderr.write("Tool request (read), path:\n")
+        sys.stderr.write(f"{path}\n")
+        if not request_tool_approval(f"read from: {path}", write_request=False):
+            return {"tool": "read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = f.read()
+        except OSError as exc:
+            return {"tool": "read", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+        return {"tool": "read", "ok": True, "exit_code": 0, "stdout": data, "stderr": "", "data": {"path": path, "content": data, "bytes": len(data.encode("utf-8"))}}
 
-def run_read_tool(path):
-    if not path: return {"tool": "read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
-    sys.stderr.write("Tool request (read), path:\n")
-    sys.stderr.write(f"{path}\n")
-    if not request_tool_approval(f"read from: {path}", write_request=False): return {"tool": "read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = f.read()
-    except OSError as exc: return {"tool": "read", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
-    return {"tool": "read", "ok": True, "exit_code": 0, "stdout": data, "stderr": "", "data": {"path": path, "content": data, "bytes": len(data.encode("utf-8"))}}
+class ListTool(BaseTool):
+    name = "list"
 
-def run_list_tool(path):
-    if not path: return {"tool": "list", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
-    sys.stderr.write("Tool request (list), path:\n")
-    sys.stderr.write(f"{path}\n")
-    if not request_tool_approval(f"list: {path}", write_request=False): return {"tool": "list", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
-    try:
-        entries = os.listdir(path)
-    except OSError as exc: return {"tool": "list", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
-    entries.sort()
-    return {"tool": "list", "ok": True, "exit_code": 0, "stdout": "\n".join(entries) + "\n", "stderr": "", "data": {"files": entries, "count": len(entries)}}
+    def argument_spec(self):
+        return {"path": str}
 
-def run_mkdir_tool(path):
-    if not path: return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
-    sys.stderr.write("Tool request (mkdir), path:\n")
-    sys.stderr.write(f"{path}\n")
-    if not request_tool_approval(f"mkdir: {path}", write_request=True): return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
-    try:
-        os.makedirs(path, exist_ok=False)
-    except FileExistsError: return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Already exists", "data": {}, "message": "Already exists"}
-    except OSError as exc: return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
-    return {"tool": "mkdir", "ok": True, "exit_code": 0, "stdout": "OK\n", "stderr": "", "data": {"path": path}}
+    def describe(self):
+        return _path_tool_description(
+            "list",
+            "List directory entries.",
+        )
+
+    def handle(self, path=None, **_):
+        if not path:
+            return {"tool": "list", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
+        sys.stderr.write("Tool request (list), path:\n")
+        sys.stderr.write(f"{path}\n")
+        if not request_tool_approval(f"list: {path}", write_request=False):
+            return {"tool": "list", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+        try:
+            entries = os.listdir(path)
+        except OSError as exc:
+            return {"tool": "list", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+        entries.sort()
+        return {"tool": "list", "ok": True, "exit_code": 0, "stdout": "\n".join(entries) + "\n", "stderr": "", "data": {"files": entries, "count": len(entries)}}
+
+class MkdirTool(BaseTool):
+    name = "mkdir"
+
+    def argument_spec(self):
+        return {"path": str}
+
+    def describe(self):
+        return _path_tool_description(
+            "mkdir",
+            "Create a new directory.",
+        )
+
+    def handle(self, path=None, **_):
+        if not path:
+            return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
+        sys.stderr.write("Tool request (mkdir), path:\n")
+        sys.stderr.write(f"{path}\n")
+        if not request_tool_approval(f"mkdir: {path}", write_request=True):
+            return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+        try:
+            os.makedirs(path, exist_ok=False)
+        except FileExistsError:
+            return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Already exists", "data": {}, "message": "Already exists"}
+        except OSError as exc:
+            return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+        return {"tool": "mkdir", "ok": True, "exit_code": 0, "stdout": "OK\n", "stderr": "", "data": {"path": path}}
 
 class HTMLToMarkdown(HTMLParser):
     def __init__(self):
@@ -349,26 +548,69 @@ def _is_text_mime(content_type):
     mime = content_type.split(";", 1)[0].strip().lower()
     return mime.startswith("text/")
 
-def run_internet_read_tool(url):
-    if not url: return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing url", "data": {}, "message": "Missing url"}
-    sys.stderr.write("Tool request (internet_read), url:\n")
-    sys.stderr.write(f"{url}\n")
-    if not request_tool_approval(url, write_request=False): return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "opx/1.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            if not _is_text_mime(content_type): return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected: non-text mime type", "data": {}, "message": "Rejected: non-text mime type"}
-            raw = resp.read()
-    except urllib.error.URLError as exc:
-        return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
-    charset = _parse_charset(content_type) or "utf-8"
-    text = raw.decode(charset, errors="replace")
-    if content_type.lower().startswith("text/html"):
-        parser = HTMLToMarkdown()
-        parser.feed(text)
-        text = parser.get_markdown()
-    return {"tool": "internet_read", "ok": True, "exit_code": 0, "stdout": text, "stderr": "", "data": {"url": url, "content": text, "bytes": len(text.encode("utf-8"))}}
+class InternetReadTool(BaseTool):
+    name = "internet_read"
+
+    def argument_spec(self):
+        return {"url": str}
+
+    def describe(self):
+        return {
+            "type": "function",
+            "function": {
+                "name": "internet_read",
+                "description": "Read a text resource from a URL; HTML is converted to Markdown.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "URL to fetch (text/* only).",
+                        }
+                    },
+                    "required": ["url"], "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        }
+
+    def handle(self, url=None, **_):
+        if not url:
+            return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing url", "data": {}, "message": "Missing url"}
+        sys.stderr.write("Tool request (internet_read), url:\n")
+        sys.stderr.write(f"{url}\n")
+        if not request_tool_approval(url, write_request=False):
+            return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "opx/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                if not _is_text_mime(content_type):
+                    return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected: non-text mime type", "data": {}, "message": "Rejected: non-text mime type"}
+                raw = resp.read()
+        except urllib.error.URLError as exc:
+            return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+        charset = _parse_charset(content_type) or "utf-8"
+        text = raw.decode(charset, errors="replace")
+        if content_type.lower().startswith("text/html"):
+            parser = HTMLToMarkdown()
+            parser.feed(text)
+            text = parser.get_markdown()
+        return {"tool": "internet_read", "ok": True, "exit_code": 0, "stdout": text, "stderr": "", "data": {"url": url, "content": text, "bytes": len(text.encode("utf-8"))}}
+
+def _tool_instances():
+    return [
+        BashTool(),
+        EditTool(),
+        WriteTool(),
+        ReadTool(),
+        ListTool(),
+        MkdirTool(),
+        InternetReadTool(),
+    ]
+
+TOOL_INSTANCES = _tool_instances()
+TOOL_REGISTRY = {tool.name: tool for tool in TOOL_INSTANCES}
 
 def _emit_content(content, writer, code_filter):
     if not content: return
@@ -379,10 +621,12 @@ def _emit_content(content, writer, code_filter):
         writer.write(content)
         writer.flush()
 
-def process_response(resp, writer, code_only, stream):
+def process_response(resp, writer, code_only, stream, tool_registry=None):
     code_filter = CodeFilter(writer) if code_only else None
     tool_calls_data = {}
     tool_call_order = []
+    if tool_registry is None:
+        tool_registry = TOOL_REGISTRY
 
     def _add_or_update_tool_call(call):
         key = call.get("id")
@@ -407,32 +651,13 @@ def process_response(resp, writer, code_only, stream):
         tool_id = tool_call.get("id")
         if tool_args and tool_name is None:
             tool_name = "bash"
-        if tool_name in ["bash", "edit", "write", "read", "list", "mkdir", "internet_read"] and tool_args:
-            try:
-                args_obj = json.loads(tool_args)
-            except json.JSONDecodeError:
-                return None
-            if tool_name == "bash":
-                command = args_obj.get("command")
-                if isinstance(command, str):
-                    return {"id": tool_id, "name": tool_name, "command": command, "arguments": tool_args}
-            if tool_name == "edit":
-                diff_text = args_obj.get("diff")
-                if isinstance(diff_text, str):
-                    return {"id": tool_id, "name": tool_name, "diff": diff_text, "arguments": tool_args}
-            if tool_name == "write":
-                path = args_obj.get("path")
-                content = args_obj.get("content")
-                if isinstance(path, str) and isinstance(content, str):
-                    return {"id": tool_id, "name": tool_name, "path": path, "content": content, "arguments": tool_args}
-            if tool_name in ["read", "list", "mkdir"]:
-                path = args_obj.get("path")
-                if isinstance(path, str):
-                    return {"id": tool_id, "name": tool_name, "path": path, "arguments": tool_args}
-            if tool_name == "internet_read":
-                url = args_obj.get("url")
-                if isinstance(url, str):
-                    return {"id": tool_id, "name": tool_name, "url": url, "arguments": tool_args}
+        tool = tool_registry.get(tool_name)
+        if tool and tool_args:
+            parsed_args = tool.parse_arguments(tool_args)
+            if parsed_args is not None:
+                tool_request = {"id": tool_id, "name": tool_name, "arguments": tool_args}
+                tool_request.update(parsed_args)
+                return tool_request
         return None
 
     if stream:
@@ -504,142 +729,7 @@ def main():
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
     ]
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "Run a single shell command and return stdout/stderr.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "Single shell command (no pipes or redirection).",
-                        }
-                    },
-                    "required": ["command"], "additionalProperties": False,
-                },
-                "strict": True,
-            },
-        }
-        ,
-        {
-            "type": "function",
-            "function": {
-                "name": "edit",
-                "description": "Apply a unified diff to edit files.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "diff": {
-                            "type": "string",
-                            "description": "Unified diff of the file edits to apply.",
-                        }
-                    },
-                    "required": ["diff"], "additionalProperties": False,
-                },
-                "strict": True,
-            },
-        }
-        ,
-        {
-            "type": "function",
-            "function": {
-                "name": "write",
-                "description": "Create a new file with provided content.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Path to the new file (must not already exist).",
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Full content of the new file.",
-                        },
-                    },
-                    "required": ["path", "content"], "additionalProperties": False,
-                },
-                "strict": True,
-            },
-        }
-        ,
-        {
-            "type": "function",
-            "function": {
-                "name": "read",
-                "description": "Read a text file and return its contents.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Path to a text file to read.",
-                        }
-                    },
-                    "required": ["path"], "additionalProperties": False,
-                },
-                "strict": True,
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list",
-                "description": "List directory entries.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Directory path to list.",
-                        }
-                    },
-                    "required": ["path"], "additionalProperties": False,
-                },
-                "strict": True,
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "mkdir",
-                "description": "Create a new directory.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Directory path to create.",
-                        }
-                    },
-                    "required": ["path"], "additionalProperties": False,
-                },
-                "strict": True,
-            },
-        }
-        ,
-        {
-            "type": "function",
-            "function": {
-                "name": "internet_read",
-                "description": "Read a text resource from a URL; HTML is converted to Markdown.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "URL to fetch (text/* only).",
-                        }
-                    },
-                    "required": ["url"], "additionalProperties": False,
-                },
-                "strict": True,
-            },
-        }
-    ]
+    tools = [tool.describe() for tool in TOOL_INSTANCES]
 
     while True:
         body = json.dumps({"model": model, "messages": messages, "tools": tools, "stream": stream})
@@ -664,30 +754,9 @@ def main():
                 )
             messages.append({"role": "assistant", "tool_calls": tool_calls})
             for tool_request in tool_requests:
-                if tool_request.get("name") == "edit":
-                    tool_result = run_edit_tool(tool_request.get("diff", ""))
-                    tool_name = "edit"
-                elif tool_request.get("name") == "write":
-                    tool_result = run_write_tool(
-                        tool_request.get("path", ""),
-                        tool_request.get("content", ""),
-                    )
-                    tool_name = "write"
-                elif tool_request.get("name") == "read":
-                    tool_result = run_read_tool(tool_request.get("path", ""))
-                    tool_name = "read"
-                elif tool_request.get("name") == "list":
-                    tool_result = run_list_tool(tool_request.get("path", ""))
-                    tool_name = "list"
-                elif tool_request.get("name") == "mkdir":
-                    tool_result = run_mkdir_tool(tool_request.get("path", ""))
-                    tool_name = "mkdir"
-                elif tool_request.get("name") == "internet_read":
-                    tool_result = run_internet_read_tool(tool_request.get("url", ""))
-                    tool_name = "internet_read"
-                else:
-                    tool_result = run_bash_tool(tool_request.get("command", ""))
-                    tool_name = "bash"
+                tool_name = tool_request.get("name") or "bash"
+                tool = TOOL_REGISTRY.get(tool_name, TOOL_REGISTRY["bash"])
+                tool_result = tool.handle_request(tool_request)
                 tool_msg = {"role": "tool", "content": json.dumps(tool_result)}
                 if tool_request.get("id"):
                     tool_msg["tool_call_id"] = tool_request.get("id")
