@@ -23,7 +23,7 @@ Options:
 """
 
 SYSTEM_PROMPT = (
-    "You are a mighty Linux system operator. Make short answers. If code is requested, output only code."
+    "You are a mighty Linux system operator. Make short answers. If code is requested, output only code. Use tools as many times as you require to solve the given task."
 )
 
 def usage(exit_code=0, err=False):
@@ -144,42 +144,47 @@ def ensure_model_available(host, port, model):
         sys.exit(1)
 
 def run_bash_tool(command):
-    if not command: return {"tool": "bash", "exit_code": 1, "stdout": "", "stderr": "Empty command"}
+    if not command:
+        return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Empty command", "data": {}, "message": "Empty command"}
     forbidden = ["|", ";", "&", ">", "<", "\n", "\r"]
+    rejectedmsg = "Rejected by user, try a different approach"
     if any(token in command for token in forbidden):
-        return {"tool": "bash", "exit_code": 1, "stdout": "", "stderr": "Rejected: unsafe command, try a safe approach"}
+        return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected: unsafe command, try a safe approach", "data": {}, "message": "Rejected: unsafe command, try a safe approach"}
     sys.stderr.write(f"Tool request: {command}\nApprove? [Y/n]: ")
     sys.stderr.flush()
     resp = sys.stdin.readline()
     if resp and resp.strip().lower() not in ["", "y", "yes"]:
-        return {"tool": "bash", "exit_code": 1, "stdout": "", "stderr": "Rejected by user, try a different approach"}
+        return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": rejectedmsg, "data": {}, "message": rejectedmsg}
     try:
         args = shlex.split(command)
     except ValueError as exc:
-        return {"tool": "bash", "exit_code": 1, "stdout": "", "stderr": str(exc)}
+        return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
     if not args:
-        return {"tool": "bash", "exit_code": 1, "stdout": "", "stderr": "Empty command"}
+        return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Empty command", "data": {}, "message": "Empty command"}
     try:
         completed = subprocess.run(args, capture_output=True, text=True)
     except OSError as exc:
-        return {"tool": "bash", "exit_code": 1, "stdout": "", "stderr": str(exc)}
-    return {
-        "tool": "bash",
-        "exit_code": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
-    }
+        return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+    return {"tool": "bash", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"command": command, "args": args}}
 
 def run_edit_tool(diff_text):
-    if not diff_text: return {"tool": "edit", "exit_code": 1, "stdout": "", "stderr": "Empty diff"}
+    def _count_files_changed(diff_body):
+        files = set()
+        for line in diff_body.splitlines():
+            if line.startswith("+++ "):
+                path = line[4:].strip()
+                if path and path != "/dev/null":
+                    files.add(path)
+        return len(files)
+
+    if not diff_text: return {"tool": "edit", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Empty diff", "data": {"applied": False, "files_changed": 0}, "message": "Empty diff"}
     sys.stderr.write("Tool request (edit), diff:\n")
     sys.stderr.write(diff_text)
     if not diff_text.endswith("\n"): sys.stderr.write("\n")
     sys.stderr.write("Approve? [Y/n]: ")
     sys.stderr.flush()
     resp = sys.stdin.readline()
-    if resp and resp.strip().lower() not in ["", "y", "yes"]:
-        return {"tool": "edit", "exit_code": 1, "stdout": "", "stderr": "Rejected by user"}
+    if resp and resp.strip().lower() not in ["", "y", "yes"]: return {"tool": "edit", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {"applied": False, "files_changed": 0}, "message": "Rejected by user"}
     try:
         completed = subprocess.run(
             ["patch", "-p0", "--forward"],
@@ -187,18 +192,13 @@ def run_edit_tool(diff_text):
             capture_output=True,
             text=True,
         )
-    except OSError as exc:
-        return {"tool": "edit", "exit_code": 1, "stdout": "", "stderr": str(exc)}
-    return {
-        "tool": "edit",
-        "exit_code": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
-    }
+    except OSError as exc: return {"tool": "edit", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {"applied": False, "files_changed": 0}, "message": str(exc)}
+    files_changed = _count_files_changed(diff_text)
+    return {"tool": "edit", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"applied": completed.returncode == 0, "files_changed": files_changed}}
 
 def run_write_tool(path, content):
-    if not path: return {"tool": "write", "exit_code": 1, "stdout": "", "stderr": "Missing path"}
-    if content is None: return {"tool": "write", "exit_code": 1, "stdout": "", "stderr": "Missing content"}
+    if not path: return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
+    if content is None: return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing content", "data": {}, "message": "Missing content"}
     sys.stderr.write("Tool request (write), path:\n")
     sys.stderr.write(f"{path}\n")
     sys.stderr.write("Content:\n")
@@ -207,65 +207,55 @@ def run_write_tool(path, content):
     sys.stderr.write("Approve? [Y/n]: ")
     sys.stderr.flush()
     resp = sys.stdin.readline()
-    if resp and resp.strip().lower() not in ["", "y", "yes"]:
-        return {"tool": "write", "exit_code": 1, "stdout": "", "stderr": "Rejected by user"}
+    if resp and resp.strip().lower() not in ["", "y", "yes"]: return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
     try:
         with open(path, "x", encoding="utf-8") as f:
             f.write(content)
-    except FileExistsError:
-        return {"tool": "write", "exit_code": 1, "stdout": "", "stderr": "File already exists"}
-    except OSError as exc:
-        return {"tool": "write", "exit_code": 1, "stdout": "", "stderr": str(exc)}
-    return {"tool": "write", "exit_code": 0, "stdout": "OK\n", "stderr": ""}
+    except FileExistsError: return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "File already exists", "data": {}, "message": "File already exists"}
+    except OSError as exc: return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+    return {"tool": "write", "ok": True, "exit_code": 0, "stdout": "OK\n", "stderr": "", "data": {"path": path, "bytes": len(content.encode("utf-8"))}}
 
 def run_read_tool(path):
-    if not path: return {"tool": "read", "exit_code": 1, "stdout": "", "stderr": "Missing path"}
+    if not path: return {"tool": "read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
     sys.stderr.write("Tool request (read), path:\n")
     sys.stderr.write(f"{path}\n")
     sys.stderr.write("Approve? [Y/n]: ")
     sys.stderr.flush()
     resp = sys.stdin.readline()
-    if resp and resp.strip().lower() not in ["", "y", "yes"]:
-        return {"tool": "read", "exit_code": 1, "stdout": "", "stderr": "Rejected by user"}
+    if resp and resp.strip().lower() not in ["", "y", "yes"]: return {"tool": "read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = f.read()
-    except OSError as exc:
-        return {"tool": "read", "exit_code": 1, "stdout": "", "stderr": str(exc)}
-    return {"tool": "read", "exit_code": 0, "stdout": data, "stderr": ""}
+    except OSError as exc: return {"tool": "read", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+    return {"tool": "read", "ok": True, "exit_code": 0, "stdout": data, "stderr": "", "data": {"path": path, "content": data, "bytes": len(data.encode("utf-8"))}}
 
 def run_list_tool(path):
-    if not path: return {"tool": "list", "exit_code": 1, "stdout": "", "stderr": "Missing path"}
+    if not path: return {"tool": "list", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
     sys.stderr.write("Tool request (list), path:\n")
     sys.stderr.write(f"{path}\n")
     sys.stderr.write("Approve? [Y/n]: ")
     sys.stderr.flush()
     resp = sys.stdin.readline()
-    if resp and resp.strip().lower() not in ["", "y", "yes"]:
-        return {"tool": "list", "exit_code": 1, "stdout": "", "stderr": "Rejected by user"}
+    if resp and resp.strip().lower() not in ["", "y", "yes"]: return {"tool": "list", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
     try:
         entries = os.listdir(path)
-    except OSError as exc:
-        return {"tool": "list", "exit_code": 1, "stdout": "", "stderr": str(exc)}
+    except OSError as exc: return {"tool": "list", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
     entries.sort()
-    return {"tool": "list", "exit_code": 0, "stdout": "\n".join(entries) + "\n", "stderr": ""}
+    return {"tool": "list", "ok": True, "exit_code": 0, "stdout": "\n".join(entries) + "\n", "stderr": "", "data": {"files": entries, "count": len(entries)}}
 
 def run_mkdir_tool(path):
-    if not path: return {"tool": "mkdir", "exit_code": 1, "stdout": "", "stderr": "Missing path"}
+    if not path: return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
     sys.stderr.write("Tool request (mkdir), path:\n")
     sys.stderr.write(f"{path}\n")
     sys.stderr.write("Approve? [Y/n]: ")
     sys.stderr.flush()
     resp = sys.stdin.readline()
-    if resp and resp.strip().lower() not in ["", "y", "yes"]:
-        return {"tool": "mkdir", "exit_code": 1, "stdout": "", "stderr": "Rejected by user"}
+    if resp and resp.strip().lower() not in ["", "y", "yes"]: return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
     try:
         os.makedirs(path, exist_ok=False)
-    except FileExistsError:
-        return {"tool": "mkdir", "exit_code": 1, "stdout": "", "stderr": "Already exists"}
-    except OSError as exc:
-        return {"tool": "mkdir", "exit_code": 1, "stdout": "", "stderr": str(exc)}
-    return {"tool": "mkdir", "exit_code": 0, "stdout": "OK\n", "stderr": ""}
+    except FileExistsError: return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Already exists", "data": {}, "message": "Already exists"}
+    except OSError as exc: return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+    return {"tool": "mkdir", "ok": True, "exit_code": 0, "stdout": "OK\n", "stderr": "", "data": {"path": path}}
 
 class HTMLToMarkdown(HTMLParser):
     def __init__(self):
@@ -355,30 +345,28 @@ def _is_text_mime(content_type):
     return mime.startswith("text/")
 
 def run_internet_read_tool(url):
-    if not url: return {"tool": "internet_read", "exit_code": 1, "stdout": "", "stderr": "Missing url"}
+    if not url: return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing url", "data": {}, "message": "Missing url"}
     sys.stderr.write("Tool request (internet_read), url:\n")
     sys.stderr.write(f"{url}\n")
     sys.stderr.write("Approve? [Y/n]: ")
     sys.stderr.flush()
     resp = sys.stdin.readline()
-    if resp and resp.strip().lower() not in ["", "y", "yes"]:
-        return {"tool": "internet_read", "exit_code": 1, "stdout": "", "stderr": "Rejected by user"}
+    if resp and resp.strip().lower() not in ["", "y", "yes"]: return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "opx/1.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             content_type = resp.headers.get("Content-Type", "")
-            if not _is_text_mime(content_type):
-                return {"tool": "internet_read", "exit_code": 1, "stdout": "", "stderr": "Rejected: non-text mime type"}
+            if not _is_text_mime(content_type): return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected: non-text mime type", "data": {}, "message": "Rejected: non-text mime type"}
             raw = resp.read()
     except urllib.error.URLError as exc:
-        return {"tool": "internet_read", "exit_code": 1, "stdout": "", "stderr": str(exc)}
+        return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
     charset = _parse_charset(content_type) or "utf-8"
     text = raw.decode(charset, errors="replace")
     if content_type.lower().startswith("text/html"):
         parser = HTMLToMarkdown()
         parser.feed(text)
         text = parser.get_markdown()
-    return {"tool": "internet_read", "exit_code": 0, "stdout": text, "stderr": ""}
+    return {"tool": "internet_read", "ok": True, "exit_code": 0, "stdout": text, "stderr": "", "data": {"url": url, "content": text, "bytes": len(text.encode("utf-8"))}}
 
 def _emit_content(content, writer, code_filter):
     if not content: return
