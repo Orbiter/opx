@@ -24,7 +24,7 @@ Options:
 """
 
 SYSTEM_PROMPT = (
-    "You are a mighty Linux system operator. Make short answers. Use tools as many times as you require to solve the given task."
+    "You are a mighty Linux system operator. Make short answers. Use tools as many times as you require to solve the given task. Don't use '|', ';', '&', '>' or '<' in bash commands."
 )
 
 DEFAULT_MODEL = "qwen3-vl:4b-instruct-q4_K_M"
@@ -628,6 +628,62 @@ def _tool_instances():
 TOOL_INSTANCES = _tool_instances()
 TOOL_REGISTRY = {tool.name: tool for tool in TOOL_INSTANCES}
 
+DEFAULT_STREAM_PREFIX = ">>> "
+
+class _LinePrefixWriter:
+    def __init__(self, writer, prefix=DEFAULT_STREAM_PREFIX, max_line_length=132):
+        self.writer = writer
+        self.prefix = prefix
+        self.at_line_start = True
+        self.line_length = 0
+        self.max_line_length = max_line_length
+
+    def write(self, content):
+        if not content or self.writer is None:
+            return
+        pending_word = ""
+
+        def flush_word():
+            nonlocal pending_word
+            if not pending_word:
+                return
+            word_len = len(pending_word)
+            if self.at_line_start:
+                self.writer.write(self.prefix)
+                self.at_line_start = False
+            if self.line_length > 0 and self.line_length + word_len > self.max_line_length:
+                self.writer.write("\n")
+                self.writer.write(self.prefix)
+                self.line_length = 0
+            self.writer.write(pending_word)
+            self.line_length += word_len
+            pending_word = ""
+
+        for ch in content:
+            if ch == "\n":
+                flush_word()
+                self.writer.write(ch)
+                self.at_line_start = True
+                self.line_length = 0
+                continue
+            if ch == " ":
+                flush_word()
+                if self.line_length > 0 and self.line_length + 1 > self.max_line_length:
+                    self.writer.write("\n")
+                    self.at_line_start = True
+                    self.line_length = 0
+                if not self.at_line_start:
+                    self.writer.write(" ")
+                    self.line_length += 1
+                continue
+            pending_word += ch
+
+        flush_word()
+
+    def flush(self):
+        if self.writer:
+            self.writer.flush()
+
 def _emit_content(content, writer):
     if not content: return
     if writer is None: return
@@ -686,9 +742,10 @@ def process_response(resp, writer, tool_registry=None, content_collector=None):
         if not choices: continue
         delta = choices[0].get("delta") or {}
         content = delta.get("content")
-        if content_collector is not None and content: content_collector.append(content)
-        _emit_content(content, writer)
         tool_calls = delta.get("tool_calls") or []
+        if content_collector is not None and content: content_collector.append(content)
+        if not tool_calls:
+            _emit_content(content, writer)
         for call in tool_calls:
             _add_or_update_tool_call(call)
 
@@ -810,6 +867,7 @@ def main():
         body = json.dumps({"model": model, "messages": messages, "tools": tools, "stream": True})
         start_time = time.monotonic()
         
+        termprint("paragraph", "\n")
         termprint("item", "Calling LLM to get tool instructions...")
         resp, _ = _http_request(host, port, "POST", "/v1/chat/completions", body=body, read_body=False, leave_open=True)
         if resp is None:
@@ -817,7 +875,8 @@ def main():
             sys.exit(1)
 
         content_chunks = [] # we collect the content to use them in the fullfillment test
-        tool_requests = process_response(resp, None, content_collector=content_chunks)
+        stream_writer = _LinePrefixWriter(sys.stdout)
+        tool_requests = process_response(resp, stream_writer, content_collector=content_chunks)
         resp.close()
 
         if tool_requests:
@@ -835,7 +894,7 @@ def main():
             for tool_request in tool_requests:
                 tool_name = tool_request.get("name") or "bash"
                 tool = TOOL_REGISTRY.get(tool_name, TOOL_REGISTRY["bash"])
-                termprint("item", _format_tool_request(tool_request), title=f"Tool call: {tool_name}", elapsed=0.0)
+                termprint("subitem", _format_tool_request(tool_request), title=f"Tool call: {tool_name}", elapsed=0.0)
                 tool_start = time.monotonic()
                 tool_result = tool.handle_request(tool_request)
                 tool_elapsed = time.monotonic() - tool_start
@@ -846,10 +905,13 @@ def main():
             continue
         assistant_elapsed = time.monotonic() - start_time
         assistant_content = "".join(content_chunks).strip()
-        termprint("paragraph", assistant_content, elapsed=assistant_elapsed)
+        if assistant_content and not assistant_content.endswith("\n"):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
         messages.append({"role": "assistant", "content": assistant_content})
         
         # test if task is fullfilled
+        termprint("paragraph", "\n")
         termprint("item", "Testing the results so far if they fulfill the initial request...")
         conversation = _format_conversation(messages)
         judge_prompt = (
