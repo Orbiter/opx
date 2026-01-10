@@ -143,6 +143,29 @@ def ensure_model_available(host, port, model):
         sys.stderr.write(f"Failed to pull model: {model}\n")
         sys.exit(1)
 
+approval_always_read = False
+approval_always_write = False
+
+def request_tool_approval(subject, write_request):
+    global approval_always_read, approval_always_write
+    if write_request and approval_always_write:
+        return True
+    if not write_request and approval_always_read:
+        return True
+    default_prompt = "[y/N]" if write_request else "[Y/n]"
+    subject_line = " ".join(str(subject).split())
+    if len(subject_line) > 120: subject_line = subject_line[:117] + "..."
+    sys.stderr.write(f"Approve '{subject_line}', {default_prompt} (a=always):")
+    sys.stderr.flush()
+    resp = sys.stdin.readline().strip().lower()
+    if resp == "a":
+        if write_request:
+            approval_always_write = True
+        else:
+            approval_always_read = True
+        return True
+    return resp in ["Y", "y", "yes"]
+
 def run_bash_tool(command):
     if not command:
         return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Empty command", "data": {}, "message": "Empty command"}
@@ -150,10 +173,7 @@ def run_bash_tool(command):
     rejectedmsg = "Rejected by user, try a different approach"
     if any(token in command for token in forbidden):
         return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected: unsafe command, try a safe approach", "data": {}, "message": "Rejected: unsafe command, try a safe approach"}
-    sys.stderr.write(f"Tool request: {command}\nApprove? [Y/n]: ")
-    sys.stderr.flush()
-    resp = sys.stdin.readline()
-    if resp and resp.strip().lower() not in ["", "y", "yes"]:
+    if not request_tool_approval(f"bash: {command}", write_request=True):
         return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": rejectedmsg, "data": {}, "message": rejectedmsg}
     try:
         args = shlex.split(command)
@@ -181,10 +201,7 @@ def run_edit_tool(diff_text):
     sys.stderr.write("Tool request (edit), diff:\n")
     sys.stderr.write(diff_text)
     if not diff_text.endswith("\n"): sys.stderr.write("\n")
-    sys.stderr.write("Approve? [Y/n]: ")
-    sys.stderr.flush()
-    resp = sys.stdin.readline()
-    if resp and resp.strip().lower() not in ["", "y", "yes"]: return {"tool": "edit", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {"applied": False, "files_changed": 0}, "message": "Rejected by user"}
+    if not request_tool_approval(diff_text, write_request=True): return {"tool": "edit", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {"applied": False, "files_changed": 0}, "message": "Rejected by user"}
     try:
         completed = subprocess.run(
             ["patch", "-p0", "--forward"],
@@ -204,10 +221,7 @@ def run_write_tool(path, content):
     sys.stderr.write("Content:\n")
     sys.stderr.write(content)
     if not content.endswith("\n"): sys.stderr.write("\n")
-    sys.stderr.write("Approve? [Y/n]: ")
-    sys.stderr.flush()
-    resp = sys.stdin.readline()
-    if resp and resp.strip().lower() not in ["", "y", "yes"]: return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+    if not request_tool_approval(f"write to: {path}", write_request=True): return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
     try:
         with open(path, "x", encoding="utf-8") as f:
             f.write(content)
@@ -219,10 +233,7 @@ def run_read_tool(path):
     if not path: return {"tool": "read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
     sys.stderr.write("Tool request (read), path:\n")
     sys.stderr.write(f"{path}\n")
-    sys.stderr.write("Approve? [Y/n]: ")
-    sys.stderr.flush()
-    resp = sys.stdin.readline()
-    if resp and resp.strip().lower() not in ["", "y", "yes"]: return {"tool": "read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+    if not request_tool_approval(f"read from: {path}", write_request=False): return {"tool": "read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = f.read()
@@ -233,10 +244,7 @@ def run_list_tool(path):
     if not path: return {"tool": "list", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
     sys.stderr.write("Tool request (list), path:\n")
     sys.stderr.write(f"{path}\n")
-    sys.stderr.write("Approve? [Y/n]: ")
-    sys.stderr.flush()
-    resp = sys.stdin.readline()
-    if resp and resp.strip().lower() not in ["", "y", "yes"]: return {"tool": "list", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+    if not request_tool_approval(f"list: {path}", write_request=False): return {"tool": "list", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
     try:
         entries = os.listdir(path)
     except OSError as exc: return {"tool": "list", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
@@ -247,10 +255,7 @@ def run_mkdir_tool(path):
     if not path: return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
     sys.stderr.write("Tool request (mkdir), path:\n")
     sys.stderr.write(f"{path}\n")
-    sys.stderr.write("Approve? [Y/n]: ")
-    sys.stderr.flush()
-    resp = sys.stdin.readline()
-    if resp and resp.strip().lower() not in ["", "y", "yes"]: return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+    if not request_tool_approval(f"mkdir: {path}", write_request=True): return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
     try:
         os.makedirs(path, exist_ok=False)
     except FileExistsError: return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Already exists", "data": {}, "message": "Already exists"}
@@ -348,10 +353,7 @@ def run_internet_read_tool(url):
     if not url: return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing url", "data": {}, "message": "Missing url"}
     sys.stderr.write("Tool request (internet_read), url:\n")
     sys.stderr.write(f"{url}\n")
-    sys.stderr.write("Approve? [Y/n]: ")
-    sys.stderr.flush()
-    resp = sys.stdin.readline()
-    if resp and resp.strip().lower() not in ["", "y", "yes"]: return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+    if not request_tool_approval(url, write_request=False): return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "opx/1.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
