@@ -2,16 +2,17 @@
 import os
 import re
 import sys
+import time
 import json
 import shlex
+import textwrap
 import argparse
 import subprocess
-import time
-import io
-import textwrap
+import unicodedata
 import http.client
 import urllib.error
 import urllib.request
+import platform
 from html.parser import HTMLParser
 
 USAGE = """Usage: opx.py [options] <prompt>
@@ -23,9 +24,15 @@ Options:
   --help          show help and exit
 """
 
-SYSTEM_PROMPT = (
-    "You are a mighty Linux system operator. Make short answers. Use tools as many times as you require to solve the given task. Don't use '|', ';', '&', '>' or '<' in bash commands."
-)
+def _system_prompt():
+    os_name = platform.platform() or platform.system() or "Unknown OS"
+    return (
+        f"You are running on {os_name}. You are a mighty Linux system operator. Use tools as many times as you require to solve the given task. "
+        "Don't use '|', ';', '&', '>' or '<' in bash commands. Make short answers. Never ask the user any questions, "
+        "always try to use tools to answer them yourself. Never try something that you tried before without success."
+    )
+
+SYSTEM_PROMPT = _system_prompt()
 
 DEFAULT_MODEL = "qwen3-vl:4b-instruct-q4_K_M"
 #DEFAULT_MODEL = "devstral-small-2:24b-instruct-2512-q4_K_M"
@@ -140,7 +147,8 @@ def _build_follow_up_prompt(conversation, initial_prompt, host, port, model):
         "Conversation so far:\n"
         f"{conversation}\n\n"
         "Review the answer and construct a prompt that uses the activities and their effect "
-        "so far to define a new prompt which shall work toward a solution of the initial prompt."
+        "so far to define a new prompt which shall work toward a solution of the initial prompt. "
+        "Don't try anything that you already tried before without success. Do something new."
     )
     data = {
         "model": model,
@@ -178,7 +186,7 @@ def ensure_model_available(host, port, model):
         termprint("error", f"Failed to pull model: {model}\n")
         sys.exit(1)
 
-approval_always_read = False
+approval_always_read = True
 approval_always_write = False
 
 def request_tool_approval(subject, write_request):
@@ -209,7 +217,7 @@ def _load_tool_args(arguments):
     except json.JSONDecodeError:
         return None
 
-def _path_tool_description(name, description):
+def tool_description(name, description, properties, required):
     return {
         "type": "function",
         "function": {
@@ -217,17 +225,26 @@ def _path_tool_description(name, description):
             "description": description,
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to target.",
-                    }
-                },
-                "required": ["path"], "additionalProperties": False,
+                "properties": properties,
+                "required": required,
+                "additionalProperties": False,
             },
             "strict": True,
         },
     }
+
+def _path_tool_description(name, description):
+    return tool_description(
+        name,
+        description,
+        {
+            "path": {
+                "type": "string",
+                "description": "Path to target.",
+            }
+        },
+        ["path"],
+    )
 
 class BaseTool:
     name = ""
@@ -269,34 +286,27 @@ class BashTool(BaseTool):
         return {"command": str}
 
     def describe(self):
-        return {
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "Run a single shell command and return stdout/stderr.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "Single shell command (no pipes or redirection).",
-                        }
-                    },
-                    "required": ["command"], "additionalProperties": False,
-                },
-                "strict": True,
+        return tool_description(
+            "bash",
+            "Run a single shell command and return stdout/stderr.",
+            {
+                "command": {
+                    "type": "string",
+                    "description": "Single shell command (no pipes or redirection).",
+                }
             },
-        }
+            ["command"],
+        )
 
     def handle(self, command=None, **_):
         if not command:
             return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Empty command", "data": {}, "message": "Empty command"}
+        if not request_tool_approval(f"bash: {command}", write_request=True):
+            reject_msg = "Rejected by user, try a different approach"
+            return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": reject_msg, "data": {}, "message": reject_msg}
         forbidden = ["|", ";", "&", ">", "<", "\n", "\r"]
         if any(token in command for token in forbidden):
             reject_msg = "Rejected: unsafe command; don't use '|', ';', '&', '>', '<'; try a safe approach"
-            return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": reject_msg, "data": {}, "message": reject_msg}
-        if not request_tool_approval(f"bash: {command}", write_request=True):
-            reject_msg = "Rejected by user, try a different approach"
             return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": reject_msg, "data": {}, "message": reject_msg}
         try:
             args = shlex.split(command)
@@ -310,6 +320,78 @@ class BashTool(BaseTool):
             return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
         return {"tool": "bash", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"command": command, "args": args}}
 
+class GitTool(BaseTool):
+    name = "git"
+
+    def argument_spec(self):
+        return {"args": list}
+
+    def describe(self):
+        return tool_description(
+            "git",
+            "Run a safe, read-only git command and return stdout/stderr.",
+            {
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Git arguments, e.g. [\"status\", \"-sb\"].",
+                }
+            },
+            ["args"],
+        )
+
+    def handle(self, args=None, **_):
+        if not isinstance(args, list) or not args:
+            return {"tool": "git", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing args", "data": {}, "message": "Missing args"}
+        subcommand = args[0]
+        allowed = {"status", "diff", "show", "log", "branch", "rev-parse", "ls-files"}
+        if subcommand not in allowed:
+            reject_msg = f"Rejected: unsafe git subcommand '{subcommand}'"
+            return {"tool": "git", "ok": False, "exit_code": 1, "stdout": "", "stderr": reject_msg, "data": {}, "message": reject_msg}
+        if not request_tool_approval(f"git {shlex.join(args)}", write_request=False):
+            reject_msg = "Rejected by user, try a different approach"
+            return {"tool": "git", "ok": False, "exit_code": 1, "stdout": "", "stderr": reject_msg, "data": {}, "message": reject_msg}
+        try:
+            completed = subprocess.run(["git", *args], capture_output=True, text=True)
+        except OSError as exc:
+            return {"tool": "git", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+        return {"tool": "git", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"args": args}}
+
+class GrepTool(BaseTool):
+    name = "grep"
+
+    def argument_spec(self):
+        return {"pattern": str, "path": str, "case_sensitive": bool}
+
+    def describe(self):
+        return tool_description(
+            "grep",
+            "Search files with ripgrep and return matching lines.",
+            {
+                "pattern": {"type": "string", "description": "Search pattern (regex)."},
+                "path": {"type": "string", "description": "File or directory to search."},
+                "case_sensitive": {"type": "boolean", "description": "Case-sensitive search (default true)."},
+            },
+            ["pattern", "path"],
+        )
+
+    def handle(self, pattern=None, path=None, case_sensitive=True, **_):
+        if not pattern or not path:
+            return {"tool": "grep", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing pattern or path", "data": {}, "message": "Missing pattern or path"}
+        if not request_tool_approval(f"grep {pattern} in {path}", write_request=False):
+            reject_msg = "Rejected by user, try a different approach"
+            return {"tool": "grep", "ok": False, "exit_code": 1, "stdout": "", "stderr": reject_msg, "data": {}, "message": reject_msg}
+        args = ["rg", "-n"]
+        if not case_sensitive:
+            args.append("-i")
+        args.extend([pattern, path])
+        try:
+            completed = subprocess.run(args, capture_output=True, text=True)
+        except OSError as exc:
+            return {"tool": "grep", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+        ok = completed.returncode in (0, 1)
+        return {"tool": "grep", "ok": ok, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"args": args}}
+
 class EditTool(BaseTool):
     name = "edit"
 
@@ -317,24 +399,17 @@ class EditTool(BaseTool):
         return {"diff": str}
 
     def describe(self):
-        return {
-            "type": "function",
-            "function": {
-                "name": "edit",
-                "description": "Apply a unified diff to edit files.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "diff": {
-                            "type": "string",
-                            "description": "Unified diff of the file edits to apply.",
-                        }
-                    },
-                    "required": ["diff"], "additionalProperties": False,
-                },
-                "strict": True,
+        return tool_description(
+            "edit",
+            "Apply a unified diff to edit or patch files.",
+            {
+                "diff": {
+                    "type": "string",
+                    "description": "Unified diff of the file edits to apply.",
+                }
             },
-        }
+            ["diff"],
+        )
 
     def _count_files_changed(self, diff_body):
         files = set()
@@ -364,6 +439,53 @@ class EditTool(BaseTool):
         files_changed = self._count_files_changed(diff)
         return {"tool": "edit", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"applied": completed.returncode == 0, "files_changed": files_changed}}
 
+class EditPreviewTool(BaseTool):
+    name = "edit_preview"
+
+    def argument_spec(self):
+        return {"diff": str}
+
+    def describe(self):
+        return tool_description(
+            "edit_preview",
+            "Preview a unified diff without applying it.",
+            {
+                "diff": {
+                    "type": "string",
+                    "description": "Unified diff of the file edits to preview.",
+                }
+            },
+            ["diff"],
+        )
+
+    def _count_files_changed(self, diff_body):
+        files = set()
+        for line in diff_body.splitlines():
+            if line.startswith("+++ "):
+                path = line[4:].strip()
+                if path and path != "/dev/null":
+                    files.add(path)
+        return len(files)
+
+    def handle(self, diff=None, **_):
+        if not diff:
+            return {"tool": "edit_preview", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Empty diff", "data": {"applied": False, "files_changed": 0}, "message": "Empty diff"}
+        termprint("subitem", "Tool request (edit_preview), diff:")
+        termprint("box", diff)
+        if not request_tool_approval("preview diff", write_request=False):
+            return {"tool": "edit_preview", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {"applied": False, "files_changed": 0}, "message": "Rejected by user"}
+        files_changed = self._count_files_changed(diff)
+        try:
+            completed = subprocess.run(
+                ["patch", "-p0", "--forward", "--dry-run"],
+                input=diff,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            return {"tool": "edit_preview", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {"applied": False, "files_changed": files_changed}, "message": str(exc)}
+        return {"tool": "edit_preview", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"applied": False, "files_changed": files_changed}}
+
 class WriteTool(BaseTool):
     name = "write"
 
@@ -371,28 +493,21 @@ class WriteTool(BaseTool):
         return {"path": str, "content": str}
 
     def describe(self):
-        return {
-            "type": "function",
-            "function": {
-                "name": "write",
-                "description": "Create a new file with provided content.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Path to the new file (must not already exist).",
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Full content of the new file.",
-                        },
-                    },
-                    "required": ["path", "content"], "additionalProperties": False,
+        return tool_description(
+            "write",
+            "Create a new file with provided content.",
+            {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the new file (must not already exist).",
                 },
-                "strict": True,
+                "content": {
+                    "type": "string",
+                    "description": "Full content of the new file.",
+                },
             },
-        }
+            ["path", "content"],
+        )
 
     def handle(self, path=None, content=None, **_):
         if not path:
@@ -459,6 +574,79 @@ class ListTool(BaseTool):
             return {"tool": "list", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
         entries.sort()
         return {"tool": "list", "ok": True, "exit_code": 0, "stdout": "\n".join(entries) + "\n", "stderr": "", "data": {"files": entries, "count": len(entries)}}
+
+class TreeTool(BaseTool):
+    name = "tree"
+
+    def argument_spec(self):
+        return {"path": str, "depth": int}
+
+    def describe(self):
+        return tool_description(
+            "tree",
+            "Create a tree listing up to a maximum depth (1-3).",
+            {
+                "path": {"type": "string", "description": "Root path for the tree listing."},
+                "depth": {"type": "integer", "description": "Maximum depth (1-3)."},
+            },
+            ["path", "depth"],
+        )
+
+    def handle(self, path=None, depth=None, **_):
+        if not path:
+            return {"tool": "tree", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
+        if not isinstance(depth, int):
+            return {"tool": "tree", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing depth", "data": {}, "message": "Missing depth"}
+        if depth < 1 or depth > 3:
+            return {"tool": "tree", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Depth must be between 1 and 3", "data": {}, "message": "Depth must be between 1 and 3"}
+        termprint("subitem", f"Tool request (tree), path: {path}, depth: {depth}")
+        if not request_tool_approval(f"tree: {path} (depth {depth})", write_request=False):
+            return {"tool": "tree", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+        if not os.path.exists(path):
+            return {"tool": "tree", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Path not found", "data": {}, "message": "Path not found"}
+        if not os.path.isdir(path):
+            return {"tool": "tree", "ok": True, "exit_code": 0, "stdout": path + "\n", "stderr": "", "data": {"path": path, "depth": depth}}
+        root_label = path.rstrip(os.sep) or path
+        lines = [root_label]
+        for root, dirs, files in os.walk(path):
+            rel = os.path.relpath(root, path)
+            root_depth = 0 if rel == "." else rel.count(os.sep) + 1
+            if root_depth >= depth:
+                dirs[:] = []
+            entries = [(name, True) for name in dirs] + [(name, False) for name in files]
+            entries.sort(key=lambda x: (not x[1], x[0]))
+            for name, is_dir in entries:
+                entry_depth = root_depth + 1
+                indent = "  " * entry_depth
+                suffix = "/" if is_dir else ""
+                lines.append(f"{indent}{name}{suffix}")
+        return {"tool": "tree", "ok": True, "exit_code": 0, "stdout": "\n".join(lines) + "\n", "stderr": "", "data": {"path": path, "depth": depth}}
+
+class ManTool(BaseTool):
+    name = "man"
+
+    def argument_spec(self):
+        return {"topic": str}
+
+    def describe(self):
+        return tool_description(
+            "man",
+            "Read a system manual page.",
+            {"topic": {"type": "string", "description": "Man page topic, e.g. \"ls\"."}},
+            ["topic"],
+        )
+
+    def handle(self, topic=None, **_):
+        if not topic:
+            return {"tool": "man", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing topic", "data": {}, "message": "Missing topic"}
+        termprint("subitem", f"Tool request (man), topic: {topic}")
+        if not request_tool_approval(f"man {topic}", write_request=False):
+            return {"tool": "man", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+        try:
+            completed = subprocess.run(["man", "-P", "cat", topic], capture_output=True, text=True)
+        except OSError as exc:
+            return {"tool": "man", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+        return {"tool": "man", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"topic": topic}}
 
 class MkdirTool(BaseTool):
     name = "mkdir"
@@ -573,24 +761,17 @@ class InternetReadTool(BaseTool):
         return {"url": str}
 
     def describe(self):
-        return {
-            "type": "function",
-            "function": {
-                "name": "internet_read",
-                "description": "Read a text resource from a URL; HTML is converted to Markdown.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "URL to fetch (text/* only).",
-                        }
-                    },
-                    "required": ["url"], "additionalProperties": False,
-                },
-                "strict": True,
+        return tool_description(
+            "internet_read",
+            "Read a text resource from a URL; HTML is converted to Markdown.",
+            {
+                "url": {
+                    "type": "string",
+                    "description": "URL to fetch (text/* only).",
+                }
             },
-        }
+            ["url"],
+        )
 
     def handle(self, url=None, **_):
         if not url: return {"tool": "internet_read", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing url", "data": {}, "message": "Missing url"}
@@ -617,10 +798,15 @@ class InternetReadTool(BaseTool):
 def _tool_instances():
     return [
         BashTool(),
+        GitTool(),
+        GrepTool(),
+        EditPreviewTool(),
         EditTool(),
         WriteTool(),
         ReadTool(),
         ListTool(),
+        TreeTool(),
+        ManTool(),
         MkdirTool(),
         InternetReadTool(),
     ]
@@ -760,6 +946,37 @@ def _format_title(base, elapsed):
     if elapsed is None: return base
     return f"{base} ({elapsed:.2f}s)"
 
+def _truncate_to_width(text, max_width):
+    if max_width <= 0:
+        return "", 0
+    out = []
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            out.append(ch)
+            continue
+        ch_width = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if width + ch_width > max_width:
+            break
+        out.append(ch)
+        width += ch_width
+    return "".join(out), width
+
+_ANSI_CSI_RE = re.compile(r"\x1b\\[[0-9;]*[A-Za-z]")
+
+def _clean_box_line(line):
+    line = _ANSI_CSI_RE.sub("", line)
+    out = []
+    for ch in line:
+        if ch == "\b":
+            if out:
+                out.pop()
+            continue
+        if ch == "\r" or ch == "\x00":
+            continue
+        out.append(ch)
+    return "".join(out)
+
 def termprint(style: str, content: str, title=None, elapsed=None, writer=sys.stdout, width=132):
     header = _format_title(title, elapsed) if title else ""
     text = content or ""
@@ -794,9 +1011,10 @@ def termprint(style: str, content: str, title=None, elapsed=None, writer=sys.std
         bottom = "╰" + ("─" * width) + "╯"
         writer.write(top + "\n")
         for line in lines:
-            line = line.expandtabs(4)
-            clipped = line[:width]
-            writer.write("│" + clipped.ljust(width) + "│\n")
+            line = _clean_box_line(line).expandtabs(4)
+            clipped, clipped_width = _truncate_to_width(line, width)
+            padding = max(0, width - clipped_width)
+            writer.write("│" + clipped + (" " * padding) + "│\n")
         writer.write(bottom + "\n")
         writer.flush()
         return
