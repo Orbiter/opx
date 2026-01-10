@@ -391,9 +391,60 @@ def _emit_content(content, writer, code_filter):
 
 def process_response(resp, writer, code_only, stream):
     code_filter = CodeFilter(writer) if code_only else None
-    tool_name = None
-    tool_args = ""
-    tool_id = None
+    tool_calls_data = {}
+    tool_call_order = []
+
+    def _add_or_update_tool_call(call):
+        key = call.get("id")
+        if key is None and call.get("index") is not None:
+            key = f"index_{call.get('index')}"
+        if key is None:
+            key = f"call_{len(tool_call_order) + 1}"
+        if key not in tool_calls_data:
+            tool_calls_data[key] = {"id": call.get("id"), "name": None, "arguments": ""}
+            tool_call_order.append(key)
+        func = call.get("function") or {}
+        name = func.get("name")
+        arguments = func.get("arguments")
+        if name:
+            tool_calls_data[key]["name"] = name
+        if arguments:
+            tool_calls_data[key]["arguments"] += arguments
+
+    def _build_tool_request(tool_call):
+        tool_name = tool_call.get("name")
+        tool_args = tool_call.get("arguments") or ""
+        tool_id = tool_call.get("id")
+        if tool_args and tool_name is None:
+            tool_name = "bash"
+        if tool_name in ["bash", "edit", "write", "read", "list", "mkdir", "internet_read"] and tool_args:
+            try:
+                args_obj = json.loads(tool_args)
+            except json.JSONDecodeError:
+                return None
+            if tool_name == "bash":
+                command = args_obj.get("command")
+                if isinstance(command, str):
+                    return {"id": tool_id, "name": tool_name, "command": command, "arguments": tool_args}
+            if tool_name == "edit":
+                diff_text = args_obj.get("diff")
+                if isinstance(diff_text, str):
+                    return {"id": tool_id, "name": tool_name, "diff": diff_text, "arguments": tool_args}
+            if tool_name == "write":
+                path = args_obj.get("path")
+                content = args_obj.get("content")
+                if isinstance(path, str) and isinstance(content, str):
+                    return {"id": tool_id, "name": tool_name, "path": path, "content": content, "arguments": tool_args}
+            if tool_name in ["read", "list", "mkdir"]:
+                path = args_obj.get("path")
+                if isinstance(path, str):
+                    return {"id": tool_id, "name": tool_name, "path": path, "arguments": tool_args}
+            if tool_name == "internet_read":
+                url = args_obj.get("url")
+                if isinstance(url, str):
+                    return {"id": tool_id, "name": tool_name, "url": url, "arguments": tool_args}
+        return None
+
     if stream:
         while True:
             line = resp.readline()
@@ -412,15 +463,7 @@ def process_response(resp, writer, code_only, stream):
             _emit_content(content, writer, code_filter)
             tool_calls = delta.get("tool_calls") or []
             for call in tool_calls:
-                func = call.get("function") or {}
-                name = func.get("name")
-                arguments = func.get("arguments")
-                if name and tool_name is None:
-                    tool_name = name
-                if call.get("id") and tool_id is None:
-                    tool_id = call.get("id")
-                if arguments:
-                    tool_args += arguments
+                _add_or_update_tool_call(call)
     else:
         body = resp.read()
         try:
@@ -436,41 +479,16 @@ def process_response(resp, writer, code_only, stream):
             _emit_content(content, writer, code_filter)
             tool_calls = message.get("tool_calls") or []
             if tool_calls:
-                call = tool_calls[0]
-                tool_id = call.get("id")
-                func = call.get("function") or {}
-                tool_name = func.get("name")
-                tool_args = func.get("arguments") or ""
+                for call in tool_calls:
+                    _add_or_update_tool_call(call)
     if code_filter: code_filter.flush()
     writer.flush()
-    if tool_args and tool_name is None: tool_name = "bash"
-    if tool_name in ["bash", "edit", "write", "read", "list", "mkdir", "internet_read"] and tool_args:
-        try:
-            args_obj = json.loads(tool_args)
-        except json.JSONDecodeError:
-            return None
-        if tool_name == "bash":
-            command = args_obj.get("command")
-            if isinstance(command, str):
-                return {"id": tool_id, "name": tool_name, "command": command, "arguments": tool_args}
-        if tool_name == "edit":
-            diff_text = args_obj.get("diff")
-            if isinstance(diff_text, str):
-                return {"id": tool_id, "name": tool_name, "diff": diff_text, "arguments": tool_args}
-        if tool_name == "write":
-            path = args_obj.get("path")
-            content = args_obj.get("content")
-            if isinstance(path, str) and isinstance(content, str):
-                return {"id": tool_id, "name": tool_name, "path": path, "content": content, "arguments": tool_args}
-        if tool_name in ["read", "list", "mkdir"]:
-            path = args_obj.get("path")
-            if isinstance(path, str):
-                return {"id": tool_id, "name": tool_name, "path": path, "arguments": tool_args}
-        if tool_name == "internet_read":
-            url = args_obj.get("url")
-            if isinstance(url, str):
-                return {"id": tool_id, "name": tool_name, "url": url, "arguments": tool_args}
-    return None
+    tool_requests = []
+    for key in tool_call_order:
+        tool_request = _build_tool_request(tool_calls_data.get(key, {}))
+        if tool_request:
+            tool_requests.append(tool_request)
+    return tool_requests
 
 def main():
     host, port, model, output_file, input_file, code_only, prompt = parse_args(sys.argv[1:])
@@ -639,45 +657,51 @@ def main():
 
         if output_path:
             with open(output_path, "w", encoding="utf-8") as f:
-                tool_request = process_response(resp, f, code_only, stream)
+                tool_requests = process_response(resp, f, code_only, stream)
         else:
-            tool_request = process_response(resp, sys.stdout, code_only, stream)
+            tool_requests = process_response(resp, sys.stdout, code_only, stream)
 
-        if tool_request:
-            if tool_request.get("name") == "edit":
-                tool_result = run_edit_tool(tool_request.get("diff", ""))
-                tool_name = "edit"
-            elif tool_request.get("name") == "write":
-                tool_result = run_write_tool(
-                    tool_request.get("path", ""),
-                    tool_request.get("content", ""),
+        if tool_requests:
+            tool_calls = []
+            for tool_request in tool_requests:
+                tool_name = tool_request.get("name")
+                tool_calls.append(
+                    {
+                        "id": tool_request.get("id") or "call_1",
+                        "type": "function",
+                        "function": {"name": tool_name, "arguments": tool_request.get("arguments", "")},
+                    }
                 )
-                tool_name = "write"
-            elif tool_request.get("name") == "read":
-                tool_result = run_read_tool(tool_request.get("path", ""))
-                tool_name = "read"
-            elif tool_request.get("name") == "list":
-                tool_result = run_list_tool(tool_request.get("path", ""))
-                tool_name = "list"
-            elif tool_request.get("name") == "mkdir":
-                tool_result = run_mkdir_tool(tool_request.get("path", ""))
-                tool_name = "mkdir"
-            elif tool_request.get("name") == "internet_read":
-                tool_result = run_internet_read_tool(tool_request.get("url", ""))
-                tool_name = "internet_read"
-            else:
-                tool_result = run_bash_tool(tool_request.get("command", ""))
-                tool_name = "bash"
-            tool_call = {
-                "id": tool_request.get("id") or "call_1",
-                "type": "function",
-                "function": {"name": tool_name, "arguments": tool_request.get("arguments", "")},
-            }
-            messages.append({"role": "assistant", "tool_calls": [tool_call]})
-            tool_msg = {"role": "tool", "content": json.dumps(tool_result)}
-            if tool_request.get("id"):
-                tool_msg["tool_call_id"] = tool_request.get("id")
-            messages.append(tool_msg)
+            messages.append({"role": "assistant", "tool_calls": tool_calls})
+            for tool_request in tool_requests:
+                if tool_request.get("name") == "edit":
+                    tool_result = run_edit_tool(tool_request.get("diff", ""))
+                    tool_name = "edit"
+                elif tool_request.get("name") == "write":
+                    tool_result = run_write_tool(
+                        tool_request.get("path", ""),
+                        tool_request.get("content", ""),
+                    )
+                    tool_name = "write"
+                elif tool_request.get("name") == "read":
+                    tool_result = run_read_tool(tool_request.get("path", ""))
+                    tool_name = "read"
+                elif tool_request.get("name") == "list":
+                    tool_result = run_list_tool(tool_request.get("path", ""))
+                    tool_name = "list"
+                elif tool_request.get("name") == "mkdir":
+                    tool_result = run_mkdir_tool(tool_request.get("path", ""))
+                    tool_name = "mkdir"
+                elif tool_request.get("name") == "internet_read":
+                    tool_result = run_internet_read_tool(tool_request.get("url", ""))
+                    tool_name = "internet_read"
+                else:
+                    tool_result = run_bash_tool(tool_request.get("command", ""))
+                    tool_name = "bash"
+                tool_msg = {"role": "tool", "content": json.dumps(tool_result)}
+                if tool_request.get("id"):
+                    tool_msg["tool_call_id"] = tool_request.get("id")
+                messages.append(tool_msg)
             continue
         break
 
