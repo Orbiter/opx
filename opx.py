@@ -5,14 +5,18 @@ import sys
 import time
 import json
 import shlex
+import socket
+import fnmatch
 import textwrap
 import argparse
+import platform
+import ipaddress
 import subprocess
 import unicodedata
 import http.client
 import urllib.error
 import urllib.request
-import platform
+import concurrent.futures
 from html.parser import HTMLParser
 
 USAGE = """Usage: opx.py [options] <prompt>
@@ -26,11 +30,13 @@ Options:
 
 def _system_prompt():
     os_name = platform.platform() or platform.system() or "Unknown OS"
-    return (
+    sys_prompt = (
         f"You are running on {os_name}. You are a mighty Linux system operator. Use tools as many times as you require to solve the given task. "
-        "Don't use '|', ';', '&', '>' or '<' in bash commands. Make short answers. Never ask the user any questions, "
-        "always try to use tools to answer them yourself. Never try something that you tried before without success."
+        "Make short answers. Never ask the user any questions, always try to use tools to answer them yourself. "
+        "Never try something that you tried before without success."
     )
+    # print(sys_prompt) # debug
+    return sys_prompt
 
 SYSTEM_PROMPT = _system_prompt()
 
@@ -288,11 +294,11 @@ class BashTool(BaseTool):
     def describe(self):
         return tool_description(
             "bash",
-            "Run a single shell command and return stdout/stderr.",
+            "Run a shell command via /bin/bash and return stdout/stderr.",
             {
                 "command": {
                     "type": "string",
-                    "description": "Single shell command (no pipes or redirection).",
+                    "description": "Shell command to run.",
                 }
             },
             ["command"],
@@ -304,21 +310,11 @@ class BashTool(BaseTool):
         if not request_tool_approval(f"bash: {command}", write_request=True):
             reject_msg = "Rejected by user, try a different approach"
             return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": reject_msg, "data": {}, "message": reject_msg}
-        forbidden = ["|", ";", "&", ">", "<", "\n", "\r"]
-        if any(token in command for token in forbidden):
-            reject_msg = "Rejected: unsafe command; don't use '|', ';', '&', '>', '<'; try a safe approach"
-            return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": reject_msg, "data": {}, "message": reject_msg}
         try:
-            args = shlex.split(command)
-        except ValueError as exc:
-            return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
-        if not args:
-            return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Empty command", "data": {}, "message": "Empty command"}
-        try:
-            completed = subprocess.run(args, capture_output=True, text=True)
+            completed = subprocess.run(["/bin/bash", "-lc", command], capture_output=True, text=True)
         except OSError as exc:
             return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
-        return {"tool": "bash", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"command": command, "args": args}}
+        return {"tool": "bash", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"command": command}}
 
 class GitTool(BaseTool):
     name = "git"
@@ -673,6 +669,252 @@ class MkdirTool(BaseTool):
             return {"tool": "mkdir", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
         return {"tool": "mkdir", "ok": True, "exit_code": 0, "stdout": "OK", "stderr": "", "data": {"path": path}}
 
+class ProcessListTool(BaseTool):
+    name = "process_list"
+
+    def describe(self):
+        return tool_description(
+            "process_list",
+            "List running processes on the current operating system.",
+            {},
+            [],
+        )
+
+    def handle(self, **_):
+        termprint("subitem", "Tool request (process_list)")
+        if not request_tool_approval("process_list", write_request=False):
+            return {"tool": "process_list", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+        try:
+            completed = subprocess.run(["ps", "-eo", "pid,ppid,comm,args"], capture_output=True, text=True)
+        except OSError as exc:
+            return {"tool": "process_list", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
+        return {"tool": "process_list", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {}}
+
+class NetworkScanTool(BaseTool):
+    name = "network_scan"
+
+    def argument_spec(self):
+        return {"target": str, "ports": list, "timeout_ms": int, "max_hosts": int}
+
+    def describe(self):
+        return tool_description(
+            "network_scan",
+            "Scan a host or local network for IPs and common services.",
+            {
+                "target": {
+                    "type": "string",
+                    "description": "Target IP, CIDR (e.g. 192.168.1.0/24), or 'self'/'localhost'. If omitted, scans local /24.",
+                },
+                "ports": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Ports to scan (default: common ports).",
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Per-connection timeout in milliseconds (default 150).",
+                },
+                "max_hosts": {
+                    "type": "integer",
+                    "description": "Maximum number of hosts to scan (default 512).",
+                },
+            },
+            [],
+        )
+
+    def _detect_local_ip(self):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect(("8.8.8.8", 80))
+                return sock.getsockname()[0]
+        except OSError:
+            pass
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return "127.0.0.1"
+
+    def _local_ip_set(self):
+        ips = {"127.0.0.1"}
+        detected = self._detect_local_ip()
+        if detected:
+            ips.add(detected)
+        try:
+            _, _, host_ips = socket.gethostbyname_ex(socket.gethostname())
+            ips.update(host_ips)
+        except OSError:
+            pass
+        return ips
+
+    def _parse_targets(self, target, max_hosts):
+        if not target:
+            local_ip = self._detect_local_ip()
+            if local_ip.startswith("127."): return None, "Local IP resolves to loopback; provide a target."
+            network = ipaddress.ip_network(f"{local_ip}/24", strict=False)
+            hosts = [str(ip) for ip in network.hosts()]
+            if len(hosts) > max_hosts:
+                return None, f"Too many hosts to scan ({len(hosts)}), set max_hosts or use a narrower target."
+            return hosts, None
+
+        target = target.strip().lower()
+        if target in ("self", "local", "localip"): return [self._detect_local_ip()], None
+        if target in ("localhost", "127.0.0.1"): return ["127.0.0.1"], None
+        if "/" in target:
+            try:
+                network = ipaddress.ip_network(target, strict=False)
+            except ValueError:
+                return None, "Invalid CIDR target."
+            hosts = [str(ip) for ip in network.hosts()]
+            if len(hosts) > max_hosts: return None, f"Too many hosts to scan ({len(hosts)}), set max_hosts or use a narrower target."
+            return hosts, None
+        try:
+            ipaddress.ip_address(target)
+        except ValueError:
+            return None, "Invalid IP target."
+        return [target], None
+
+    def _is_local_only(self, target, hosts):
+        if not target and hosts: return False
+        if target:
+            target = target.strip().lower()
+            if target in ("localhost", "127.0.0.1", "self", "local", "localip"): return True
+        if len(hosts) != 1: return False
+        return hosts[0] in self._local_ip_set()
+
+    def _service_name(self, port):
+        try:
+            return socket.getservbyport(port)
+        except OSError:
+            return "unknown"
+
+    def _scan_host(self, host, ports, timeout_sec):
+        open_ports = []
+        for port in ports:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(timeout_sec)
+                    result = sock.connect_ex((host, port))
+                if result == 0:
+                    open_ports.append({"port": port, "service": self._service_name(port)})
+            except OSError:
+                continue
+        return {"host": host, "open_ports": open_ports}
+
+    def handle(self, target=None, ports=None, timeout_ms=None, max_hosts=None, **_):
+        termprint("subitem", "Tool request (network_scan)")
+
+        if ports is None: ports = [22, 23, 25, 53, 80, 110, 139, 143, 443, 445, 3389, 3306, 5432, 6379, 27017]
+        if timeout_ms is None: timeout_ms = 150
+        if max_hosts is None: max_hosts = 512
+
+        if not isinstance(ports, list) or not all(isinstance(p, int) for p in ports):
+            return {"tool": "network_scan", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Invalid ports list", "data": {}, "message": "Invalid ports list"}
+        if not isinstance(timeout_ms, int) or timeout_ms < 1:
+            return {"tool": "network_scan", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Invalid timeout_ms", "data": {}, "message": "Invalid timeout_ms"}
+        if not isinstance(max_hosts, int) or max_hosts < 1:
+            return {"tool": "network_scan", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Invalid max_hosts", "data": {}, "message": "Invalid max_hosts"}
+
+        hosts, error = self._parse_targets(target, max_hosts)
+        if error:
+            return {"tool": "network_scan", "ok": False, "exit_code": 1, "stdout": "", "stderr": error, "data": {}, "message": error}
+
+        if not self._is_local_only(target, hosts):
+            if not request_tool_approval("network_scan (non-local)", write_request=True):
+                return {"tool": "network_scan", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+
+        timeout_sec = timeout_ms / 1000.0
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(64, len(hosts) or 1)) as executor:
+            futures = [executor.submit(self._scan_host, host, ports, timeout_sec) for host in hosts]
+            for future in concurrent.futures.as_completed(futures):
+                results.append(future.result())
+
+        results.sort(key=lambda item: item["host"])
+        lines = []
+        for item in results:
+            host = item["host"]
+            ports_info = item["open_ports"]
+            if not ports_info:
+                lines.append(f"{host}: no open ports detected")
+                continue
+            port_text = ", ".join(f"{p['port']}/{p['service']}" for p in ports_info)
+            lines.append(f"{host}: {port_text}")
+        output = "\n".join(lines) + ("\n" if lines else "")
+
+        return {"tool": "network_scan", "ok": True, "exit_code": 0, "stdout": output, "stderr": "", "data": {"targets": hosts, "ports": ports, "results": results}}
+
+class ToolListTool(BaseTool):
+    name = "tool_list"
+
+    def describe(self):
+        return tool_description("tool_list", "List all available tools and their descriptions.", {}, [])
+
+    def handle(self, **_):
+        termprint("subitem", "Tool request (tool_list)")
+        if not request_tool_approval("tool_list", write_request=False):
+            return {"tool": "tool_list", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+        lines = []
+        for tool in TOOL_INSTANCES:
+            info = tool.describe().get("function", {})
+            name = info.get("name") or tool.name
+            desc = info.get("description") or ""
+            lines.append(f"{name}: {desc}".strip())
+        output = "\n".join(lines) + ("\n" if lines else "")
+        return {"tool": "tool_list", "ok": True, "exit_code": 0, "stdout": output, "stderr": "", "data": {"count": len(lines)}}
+
+class FindTool(BaseTool):
+    name = "find"
+
+    def argument_spec(self):
+        return {"path": str, "name": str, "type": str, "max_depth": int}
+
+    def describe(self):
+        return tool_description(
+            "find",
+            "Find files or directories starting at a path, optionally filtering by name, type, or depth.",
+            {
+                "path": {"type": "string", "description": "Root path to search."},
+                "name": {"type": "string", "description": "Optional glob pattern to match (e.g. '*.conf')."},
+                "type": {"type": "string", "description": "Optional entry type filter: 'f' for files or 'd' for directories."},
+                "max_depth": {"type": "integer", "description": "Optional maximum depth relative to path."},
+            },
+            ["path"],
+        )
+
+    def handle(self, path=None, name=None, type=None, max_depth=None, **_):
+        if not path:
+            return {"tool": "find", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing path", "data": {}, "message": "Missing path"}
+        termprint("subitem", f"Tool request (find), path: {path}")
+        if not request_tool_approval(f"find: {path}", write_request=False):
+            return {"tool": "find", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
+        if type is not None and type not in ("f", "d"):
+            return {"tool": "find", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Invalid type (use 'f' or 'd')", "data": {}, "message": "Invalid type"}
+        if max_depth is not None and (not isinstance(max_depth, int) or max_depth < 0):
+            return {"tool": "find", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Invalid max_depth", "data": {}, "message": "Invalid max_depth"}
+        if not os.path.exists(path):
+            return {"tool": "find", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Path not found", "data": {}, "message": "Path not found"}
+
+        results = []
+        base_depth = path.rstrip(os.sep).count(os.sep)
+        for root, dirs, files in os.walk(path):
+            depth = root.count(os.sep) - base_depth
+            if max_depth is not None and depth > max_depth:
+                dirs[:] = []
+                continue
+            entries = []
+            if type in (None, "d"):
+                entries.extend([(d, True) for d in dirs])
+            if type in (None, "f"):
+                entries.extend([(f, False) for f in files])
+            for entry, is_dir in entries:
+                if name and not fnmatch.fnmatch(entry, name):
+                    continue
+                full_path = os.path.join(root, entry)
+                results.append(full_path)
+        results.sort()
+        output = "\n".join(results) + ("\n" if results else "")
+        return {"tool": "find", "ok": True, "exit_code": 0, "stdout": output, "stderr": "", "data": {"count": len(results)}}
+
 class HTMLToMarkdown(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -682,8 +924,7 @@ class HTMLToMarkdown(HTMLParser):
         self.link_text = []
 
     def _ensure_blankline(self):
-        if not self.out:
-            return
+        if not self.out: return
         text = "".join(self.out)
         if not text.endswith("\n\n"):
             if text.endswith("\n"):
@@ -797,8 +1038,10 @@ class InternetReadTool(BaseTool):
 
 def _tool_instances():
     return [
+        ToolListTool(),
         BashTool(),
         GitTool(),
+        FindTool(),
         GrepTool(),
         EditPreviewTool(),
         EditTool(),
@@ -808,6 +1051,8 @@ def _tool_instances():
         TreeTool(),
         ManTool(),
         MkdirTool(),
+        ProcessListTool(),
+        NetworkScanTool(),
         InternetReadTool(),
     ]
 
@@ -962,7 +1207,7 @@ def _truncate_to_width(text, max_width):
         width += ch_width
     return "".join(out), width
 
-_ANSI_CSI_RE = re.compile(r"\x1b\\[[0-9;]*[A-Za-z]")
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 def _clean_box_line(line):
     line = _ANSI_CSI_RE.sub("", line)

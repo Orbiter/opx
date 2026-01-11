@@ -96,21 +96,6 @@ Options:
   Port number of the API endpoint.  
   Default: `11434`
 
-* `-o <file>`  
-  Write the LLM output to the specified file instead of stdout.  
-  When this option is used, streaming is disabled and the full response
-  is written once completed.
-
-* `-e <file>`  
-  Read additional input from a file.  
-  The file content is appended to the prompt and wrapped in a fenced
-  code block.
-
-* `-c`  
-  Code-only mode.  
-  Only content inside triple-backtick code blocks is emitted.
-  All other text is suppressed.
-
 * `--help`  
   Print a short usage summary and exit.
 
@@ -122,28 +107,6 @@ Examples of valid prompts:
 * asking for code snippets
 * asking the LLM to inspect files or system state (via approved commands)
 
-### Input sources
-
-`opx` can combine multiple input sources into a single prompt:
-
-* command-line prompt text
-* file content via `-e <file>`
-* piped stdin
-
-If file or stdin input is provided, it is wrapped into a fenced code block
-and appended to the prompt automatically.
-
-### Output modes
-
-* By default, output is streamed to stdout
-* With `-o <file>`, output is written to a file
-* With `-c`, only content inside triple-backtick code blocks is emitted
-
-This makes `opx` suitable for:
-
-* generating shell scripts
-* generating configuration files
-* extracting code-only answers
 
 ### Tool execution
 
@@ -158,7 +121,7 @@ Only a single command without pipes or redirection is allowed.
 
 ---
 
-## Minimal example
+## Examples
 
 ```
 opx "add opx to the seek path"
