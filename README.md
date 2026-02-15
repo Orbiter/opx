@@ -32,7 +32,7 @@ The program operates as follows:
 * `bash` and `curl`
 * Python 3 (for `opx.py`)
 * A running **Ollama** instance
-* A compatible model (**TBD**, must support chat completions and tool calling)
+* A compatible model (**quen3:30b-a3b-instruct-2507-q4_K_M**, requires ~60GB VRAM)
 
 By default, `opx` connects to:
 
@@ -47,9 +47,11 @@ By default, `opx` connects to:
 
    Ensure that Ollama is running locally and listening on port `11434`.
 
-2. Install a compatible model
+2. Install the **qwen3:30b-a3b-instruct-2507-q4_K_M** model
 
-   The required model is **TBD**. Once decided, it must be pulled via Ollama.
+   ```
+   ollama pull qwen3:30b-a3b-instruct-2507-q4_K_M
+   ```
 
 3. Install `opx`
 
@@ -58,11 +60,11 @@ By default, `opx` connects to:
    ```
    git clone https://github.com/Orbiter/opx
    cd opx
-   chmod +x opx.sh
-   sudo cp opx.sh /usr/local/bin/opx
+   chmod +x opx.py
+   sudo cp opx.py /usr/local/bin/opx
    ```
 
-   Alternatively, use `opx.py` if you prefer Python.
+   Alternatively, use `opx.sh` if you prefer shell.
 
 ---
 
@@ -96,28 +98,35 @@ Options:
   Port number of the API endpoint.  
   Default: `11434`
 
+* `-e <file>`  
+  Read file content instead of stdin.
+
 * `--help`  
   Print a short usage summary and exit.
 
+### Tool Execution
 
-Examples of valid prompts:
+`opx` integrates with a rich suite of tools to perform system operations safely:
 
-* describing a system task
-* asking for shell commands
-* asking for code snippets
-* asking the LLM to inspect files or system state (via approved commands)
+| Tool | Description |
+|------|-------------|
+| `bash` | Run a shell command via `/bin/bash` and return `stdout`/`stderr` |
+| `git` | Run a safe, read-only `git` command and return `stdout`/`stderr` |
+| `find` | Find files or directories starting at a path, optionally filtering by name, type, or depth |
+| `grep` | Search files with `ripgrep` and return matching lines |
+| `edit_preview` | Preview a unified diff without applying it |
+| `edit` | Apply a unified diff to edit or patch files |
+| `write` | Create or overwrite a file with provided content |
+| `read` | Read a text file and return its contents |
+| `list` | List directory entries |
+| `tree` | Create a tree listing up to a maximum depth (1-3) |
+| `man` | Read a system manual page |
+| `mkdir` | Create a new directory |
+| `process_list` | List running processes filtered by a required search pattern |
+| `network_scan` | Scan a host or local network for IPs and common services |
+| `internet_read` | Read a text resource from a URL; HTML is converted to Markdown |
 
-
-### Tool execution
-
-If the LLM requests execution of a shell command:
-
-* the command is printed to stderr
-* the user is asked for confirmation
-* the command is executed locally using `subprocess`
-* stdout, stderr, and exit code are returned to the LLM
-
-Only a single command without pipes or redirection is allowed.
+All tool executions are **explicitly approved** by the user and are **not allowed to chain, redirect, or pipe**.
 
 ---
 
@@ -127,6 +136,26 @@ Only a single command without pipes or redirection is allowed.
 opx "add opx to the seek path"
 ```
 
+```
+opx "show all running processes with 'python' in the name"
+```
+
+```
+opx "create a new directory named 'project' and add a README.md file with 'Hello, world!' content"
+```
+
+```
+opx "find all files named 'Dockerfile' in the current directory or subdirectories"
+```
+
+```
+opx "read the README.md file"
+```
+
+```
+opx "scan my local network for open ports 80, 443, and 3389"
+```
+
 ---
 
 ## Notes
@@ -134,3 +163,6 @@ opx "add opx to the seek path"
 * `opx` does not execute commands automatically
 * Shell commands requested by the LLM always require explicit user approval
 * Network or execution errors are reported directly
+* All tools are sandboxed and do not allow unsafe operations like file deletion or system reboots
+* The model version `qwen3:30b-a3b-instruct-2507-q4_K_M` is recommended for best performance due to its large context window and tool-calling capability
+* Environment variables like `OPX_AUTO_APPROVE` can be used to automate approvals (`read`, `write`, or `all`)

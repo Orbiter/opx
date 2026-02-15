@@ -564,11 +564,11 @@ class WriteTool(BaseTool):
     def describe(self):
         return tool_description(
             "write",
-            "Create a new file with provided content.",
+            "Create or overwrite a file with provided content.",
             {
                 "path": {
                     "type": "string",
-                    "description": "Path to the new file (must not already exist).",
+                    "description": "Path to the file to create or overwrite.",
                 },
                 "content": {
                     "type": "string",
@@ -585,13 +585,14 @@ class WriteTool(BaseTool):
             return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing content", "data": {}, "message": "Missing content"}
         termprint("subitem", f"Tool request (write), path: {path}")
         termprint("box", content)
-        if not request_tool_approval(f"write to: {path}", write_request=True):
+        approval_subject = f"write to: {path}"
+        if os.path.exists(path):
+            approval_subject = f"overwrite existing file: {path}"
+        if not request_tool_approval(approval_subject, write_request=True):
             return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
         try:
-            with open(path, "x", encoding="utf-8") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
-        except FileExistsError:
-            return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": "File already exists", "data": {}, "message": "File already exists"}
         except OSError as exc:
             return {"tool": "write", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
         return {"tool": "write", "ok": True, "exit_code": 0, "stdout": "OK\n", "stderr": "", "data": {"path": path, "bytes": len(content.encode("utf-8"))}}
