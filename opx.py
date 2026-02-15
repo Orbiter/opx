@@ -40,9 +40,9 @@ def _system_prompt():
 
 SYSTEM_PROMPT = _system_prompt()
 
-DEFAULT_MODEL = "qwen3-vl:4b-instruct-q4_K_M"
-#DEFAULT_MODEL = "devstral-small-2:24b-instruct-2512-q4_K_M"
-#DEFAULT_MODEL = "hf.co/unsloth/gpt-oss-20b-GGUF:Q4_K_M"
+DEFAULT_MODEL = "qwen3:30b-a3b-instruct-2507-q4_K_M"
+DEFAULT_TOOL_TIMEOUT_SEC = int((os.environ.get("OPX_TOOL_TIMEOUT_SEC") or "300").strip() or "300")
+DEFAULT_MAX_TURNS = int((os.environ.get("OPX_MAX_TURNS") or "24").strip() or "24")
 
 def usage(exit_code=0, err=False):
     if err:
@@ -71,7 +71,7 @@ def parse_args(argv):
     return args.host, args.port, args.model, args.input_file, prompt
 
 def _http_request(host, port, method, path, body=None, read_body=True, leave_open=False):
-    conn = http.client.HTTPConnection(host, int(port), timeout=60)
+    conn = http.client.HTTPConnection(host, int(port), timeout=600)
     try:
         headers = {"Content-Type": "application/json"} if body is not None else {}
         conn.request(method, path, body=body, headers=headers)
@@ -197,6 +197,15 @@ approval_always_write = False
 
 def request_tool_approval(subject, write_request):
     global approval_always_read, approval_always_write
+    auto_approve = (os.environ.get("OPX_AUTO_APPROVE") or "").strip().lower()
+    if auto_approve in ("1", "true", "yes", "all"):
+        return True
+    if auto_approve == "read" and not write_request:
+        return True
+    if auto_approve == "write" and write_request:
+        return True
+    if auto_approve in ("0", "false", "no", "none"):
+        return False
     if write_request and approval_always_write:
         return True
     if not write_request and approval_always_read:
@@ -258,6 +267,9 @@ class BaseTool:
     def describe(self):
         raise NotImplementedError
 
+    def max_calls_per_turn(self):
+        raise NotImplementedError
+
     def argument_spec(self):
         return {}
 
@@ -270,7 +282,12 @@ class BaseTool:
             return {}
         parsed = {}
         for key, expected_type in spec.items():
+            if key not in args:
+                continue
             value = args.get(key)
+            if value is None:
+                # Treat explicit null like an omitted optional field.
+                continue
             if expected_type is str:
                 if not isinstance(value, str):
                     return None
@@ -287,6 +304,9 @@ class BaseTool:
 
 class BashTool(BaseTool):
     name = "bash"
+
+    def max_calls_per_turn(self):
+        return 10
 
     def argument_spec(self):
         return {"command": str}
@@ -307,17 +327,52 @@ class BashTool(BaseTool):
     def handle(self, command=None, **_):
         if not command:
             return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Empty command", "data": {}, "message": "Empty command"}
+        if re.search(r"^\s*find\s+/\b", command) and "-maxdepth" not in command:
+            reject_msg = "Rejected: broad 'find /' without -maxdepth is too expensive; narrow the path."
+            return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": reject_msg, "data": {"command": command}, "message": reject_msg}
         if not request_tool_approval(f"bash: {command}", write_request=True):
             reject_msg = "Rejected by user, try a different approach"
             return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": reject_msg, "data": {}, "message": reject_msg}
+        start_exec = time.monotonic()
         try:
-            completed = subprocess.run(["/bin/bash", "-lc", command], capture_output=True, text=True)
+            completed = subprocess.run(
+                ["/bin/bash", "-lc", command],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired as exc:
+            elapsed_exec = time.monotonic() - start_exec
+            partial_stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+            partial_stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            timeout_msg = "Timed out after 10s"
+            combined_stderr = f"{timeout_msg}\n{partial_stderr}".strip() if partial_stderr else timeout_msg
+            return {
+                "tool": "bash",
+                "ok": False,
+                "exit_code": 124,
+                "stdout": partial_stdout,
+                "stderr": combined_stderr,
+                "data": {"command": command, "elapsed_exec_sec": elapsed_exec},
+                "message": "Tool timeout",
+            }
         except OSError as exc:
             return {"tool": "bash", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
-        return {"tool": "bash", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"command": command}}
+        elapsed_exec = time.monotonic() - start_exec
+        return {
+            "tool": "bash",
+            "ok": completed.returncode == 0,
+            "exit_code": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "data": {"command": command, "elapsed_exec_sec": elapsed_exec},
+        }
 
 class GitTool(BaseTool):
     name = "git"
+
+    def max_calls_per_turn(self):
+        return 10
 
     def argument_spec(self):
         return {"args": list}
@@ -356,6 +411,9 @@ class GitTool(BaseTool):
 class GrepTool(BaseTool):
     name = "grep"
 
+    def max_calls_per_turn(self):
+        return 10
+
     def argument_spec(self):
         return {"pattern": str, "path": str, "case_sensitive": bool}
 
@@ -390,6 +448,9 @@ class GrepTool(BaseTool):
 
 class EditTool(BaseTool):
     name = "edit"
+
+    def max_calls_per_turn(self):
+        return 5
 
     def argument_spec(self):
         return {"diff": str}
@@ -429,7 +490,10 @@ class EditTool(BaseTool):
                 input=diff,
                 capture_output=True,
                 text=True,
+                timeout=DEFAULT_TOOL_TIMEOUT_SEC,
             )
+        except subprocess.TimeoutExpired:
+            return {"tool": "edit", "ok": False, "exit_code": 124, "stdout": "", "stderr": f"Timed out after {DEFAULT_TOOL_TIMEOUT_SEC}s", "data": {"applied": False, "files_changed": 0}, "message": "Tool timeout"}
         except OSError as exc:
             return {"tool": "edit", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {"applied": False, "files_changed": 0}, "message": str(exc)}
         files_changed = self._count_files_changed(diff)
@@ -437,6 +501,9 @@ class EditTool(BaseTool):
 
 class EditPreviewTool(BaseTool):
     name = "edit_preview"
+
+    def max_calls_per_turn(self):
+        return 5
 
     def argument_spec(self):
         return {"diff": str}
@@ -477,13 +544,19 @@ class EditPreviewTool(BaseTool):
                 input=diff,
                 capture_output=True,
                 text=True,
+                timeout=DEFAULT_TOOL_TIMEOUT_SEC,
             )
+        except subprocess.TimeoutExpired:
+            return {"tool": "edit_preview", "ok": False, "exit_code": 124, "stdout": "", "stderr": f"Timed out after {DEFAULT_TOOL_TIMEOUT_SEC}s", "data": {"applied": False, "files_changed": files_changed}, "message": "Tool timeout"}
         except OSError as exc:
             return {"tool": "edit_preview", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {"applied": False, "files_changed": files_changed}, "message": str(exc)}
         return {"tool": "edit_preview", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"applied": False, "files_changed": files_changed}}
 
 class WriteTool(BaseTool):
     name = "write"
+
+    def max_calls_per_turn(self):
+        return 5
 
     def argument_spec(self):
         return {"path": str, "content": str}
@@ -526,6 +599,9 @@ class WriteTool(BaseTool):
 class ReadTool(BaseTool):
     name = "read"
 
+    def max_calls_per_turn(self):
+        return 10
+
     def argument_spec(self):
         return {"path": str}
 
@@ -550,6 +626,9 @@ class ReadTool(BaseTool):
 class ListTool(BaseTool):
     name = "list"
 
+    def max_calls_per_turn(self):
+        return 10
+
     def argument_spec(self):
         return {"path": str}
 
@@ -573,6 +652,9 @@ class ListTool(BaseTool):
 
 class TreeTool(BaseTool):
     name = "tree"
+
+    def max_calls_per_turn(self):
+        return 10
 
     def argument_spec(self):
         return {"path": str, "depth": int}
@@ -621,6 +703,9 @@ class TreeTool(BaseTool):
 class ManTool(BaseTool):
     name = "man"
 
+    def max_calls_per_turn(self):
+        return 3
+
     def argument_spec(self):
         return {"topic": str}
 
@@ -647,6 +732,9 @@ class ManTool(BaseTool):
 class MkdirTool(BaseTool):
     name = "mkdir"
 
+    def max_calls_per_turn(self):
+        return 5
+
     def argument_spec(self):
         return {"path": str}
 
@@ -672,26 +760,52 @@ class MkdirTool(BaseTool):
 class ProcessListTool(BaseTool):
     name = "process_list"
 
+    def max_calls_per_turn(self):
+        return 5
+
+    def argument_spec(self):
+        return {"pattern": str}
+
     def describe(self):
         return tool_description(
             "process_list",
-            "List running processes on the current operating system.",
-            {},
-            [],
+            "List running processes filtered by a required search pattern.",
+            {
+                "pattern": {
+                    "type": "string",
+                    "description": "Required non-empty substring filter for process rows (e.g. 'python').",
+                }
+            },
+            ["pattern"],
         )
 
-    def handle(self, **_):
-        termprint("subitem", "Tool request (process_list)")
+    def handle(self, pattern=None, **_):
+        pattern = (pattern or "").strip()
+        if not pattern:
+            return {"tool": "process_list", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Missing pattern", "data": {}, "message": "Missing pattern"}
+        termprint("subitem", f"Tool request (process_list), pattern: {pattern}")
         if not request_tool_approval("process_list", write_request=False):
             return {"tool": "process_list", "ok": False, "exit_code": 1, "stdout": "", "stderr": "Rejected by user", "data": {}, "message": "Rejected by user"}
         try:
             completed = subprocess.run(["ps", "-eo", "pid,ppid,comm,args"], capture_output=True, text=True)
         except OSError as exc:
             return {"tool": "process_list", "ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "data": {}, "message": str(exc)}
-        return {"tool": "process_list", "ok": completed.returncode == 0, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {}}
+        if completed.returncode != 0:
+            return {"tool": "process_list", "ok": False, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "data": {"pattern": pattern}}
+        lines = completed.stdout.splitlines()
+        if not lines:
+            return {"tool": "process_list", "ok": True, "exit_code": 0, "stdout": "", "stderr": "", "data": {"pattern": pattern, "count": 0}}
+        header = lines[0]
+        needle = pattern.lower()
+        matched = [line for line in lines[1:] if needle in line.lower()]
+        out_lines = [header, *matched] if matched else [header]
+        return {"tool": "process_list", "ok": True, "exit_code": 0, "stdout": "\n".join(out_lines) + "\n", "stderr": "", "data": {"pattern": pattern, "count": len(matched)}}
 
 class NetworkScanTool(BaseTool):
     name = "network_scan"
+
+    def max_calls_per_turn(self):
+        return 1
 
     def argument_spec(self):
         return {"target": str, "ports": list, "timeout_ms": int, "max_hosts": int}
@@ -846,6 +960,9 @@ class NetworkScanTool(BaseTool):
 class ToolListTool(BaseTool):
     name = "tool_list"
 
+    def max_calls_per_turn(self):
+        return 1
+
     def describe(self):
         return tool_description("tool_list", "List all available tools and their descriptions.", {}, [])
 
@@ -864,6 +981,9 @@ class ToolListTool(BaseTool):
 
 class FindTool(BaseTool):
     name = "find"
+
+    def max_calls_per_turn(self):
+        return 10
 
     def argument_spec(self):
         return {"path": str, "name": str, "type": str, "max_depth": int}
@@ -997,6 +1117,9 @@ def _is_text_mime(content_type):
 
 class InternetReadTool(BaseTool):
     name = "internet_read"
+
+    def max_calls_per_turn(self):
+        return 10
 
     def argument_spec(self):
         return {"url": str}
@@ -1149,7 +1272,12 @@ def process_response(resp, writer, tool_registry=None, content_collector=None):
         tool_args = tool_call.get("arguments") or ""
         tool_id = tool_call.get("id")
         if tool_args and tool_name is None:
-            tool_name = "bash"
+            # If exactly one tool is visible, map unnamed calls to it.
+            # This avoids forcing an implicit "bash" when tools are filtered.
+            if len(tool_registry) == 1:
+                tool_name = next(iter(tool_registry.keys()))
+            else:
+                tool_name = "bash"
         tool = tool_registry.get(tool_name)
         if tool and tool_args:
             parsed_args = tool.parse_arguments(tool_args)
@@ -1159,26 +1287,29 @@ def process_response(resp, writer, tool_registry=None, content_collector=None):
                 return tool_request
         return None
 
-    while True:
-        line = resp.readline()
-        if not line: break
-        if not line.startswith(b"data:"): continue
-        data = line[5:].strip()
-        if data == b"[DONE]": break
-        try:
-            payload = json.loads(data)
-        except json.JSONDecodeError:
-            continue
-        choices = payload.get("choices") or []
-        if not choices: continue
-        delta = choices[0].get("delta") or {}
-        content = delta.get("content")
-        tool_calls = delta.get("tool_calls") or []
-        if content_collector is not None and content: content_collector.append(content)
-        if not tool_calls:
-            _emit_content(content, writer)
-        for call in tool_calls:
-            _add_or_update_tool_call(call)
+    try:
+        while True:
+            line = resp.readline()
+            if not line: break
+            if not line.startswith(b"data:"): continue
+            data = line[5:].strip()
+            if data == b"[DONE]": break
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            choices = payload.get("choices") or []
+            if not choices: continue
+            delta = choices[0].get("delta") or {}
+            content = delta.get("content")
+            tool_calls = delta.get("tool_calls") or []
+            if content_collector is not None and content: content_collector.append(content)
+            if not tool_calls:
+                _emit_content(content, writer)
+            for call in tool_calls:
+                _add_or_update_tool_call(call)
+    except (OSError, TimeoutError, http.client.HTTPException) as exc:
+        termprint("error", f"Stream read failed: {exc}")
 
     if writer: writer.flush()
     tool_requests = []
@@ -1294,6 +1425,44 @@ def _format_tool_result(tool_result):
         lines.append(message if message else "OK")
     return "\n".join(lines)
 
+def _resolve_visible_tools():
+    only_tools_raw = (os.environ.get("OPX_ONLY_TOOLS") or "").strip()
+    if not only_tools_raw:
+        return TOOL_INSTANCES
+    wanted = [name.strip() for name in only_tools_raw.split(",") if name.strip()]
+    visible = []
+    unknown = []
+    for name in wanted:
+        tool = TOOL_REGISTRY.get(name)
+        if tool is None:
+            unknown.append(name)
+        else:
+            visible.append(tool)
+    if unknown:
+        termprint("error", f"Unknown tool(s) in OPX_ONLY_TOOLS: {', '.join(unknown)}")
+        sys.exit(2)
+    if not visible:
+        termprint("error", "OPX_ONLY_TOOLS resolved to an empty tool set.")
+        sys.exit(2)
+    return visible
+
+def _apply_tool_call_budgets(tool_requests, call_register):
+    # Per-turn register of tool usage counts (mutated in-place).
+    allowed = []
+    dropped = {}
+    for tool_request in tool_requests:
+        tool_name = tool_request.get("name") or "bash"
+        tool = TOOL_REGISTRY.get(tool_name, TOOL_REGISTRY["bash"])
+        normalized_name = tool.name
+        limit = tool.max_calls_per_turn()
+        current = call_register.get(normalized_name, 0)
+        if current >= limit:
+            dropped[normalized_name] = dropped.get(normalized_name, 0) + 1
+            continue
+        call_register[normalized_name] = current + 1
+        allowed.append({"tool_request": tool_request, "tool": tool})
+    return allowed, dropped
+
 def main():
     host, port, model, input_file, prompt = parse_args(sys.argv[1:])
     
@@ -1302,12 +1471,6 @@ def main():
     termprint("paragraph", "| (_) ||  _/  >  < ")
     termprint("paragraph", " \\___/ |_|   /_/\\_\\")
     termprint("paragraph", "")
-
-    #termprint("paragraph", " _     _   _   ___            ___   ___  __  __")
-    #termprint("paragraph", "| |_  | |_| |_ | _ \(_)  / / / _ \\ | _ \\ \\ \\/ /")
-    #termprint("paragraph", "| ' \ |  _|  _||  _/    / / | (_) ||  _/  >  < ")
-    #termprint("paragraph", "|_||_| \__|\__ |_|  (_)/ /  \\___/ |_|   /_/\\_\\")
-    #termprint("paragraph", "")
 
     termprint("paragraph", f"Using model: {model} at {host}:{port}")
     termprint("paragraph", "")
@@ -1324,9 +1487,23 @@ def main():
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
     ]
-    tools = [tool.describe() for tool in TOOL_INSTANCES]
+    visible_tools = _resolve_visible_tools()
+    visible_tool_names = {tool.name for tool in visible_tools}
+    visible_tool_registry = {tool.name: tool for tool in visible_tools}
+    turn_call_register = {}
+    synthetic_call_seq = 0
+    turn_count = 0
 
     while True:
+        turn_count += 1
+        if turn_count > DEFAULT_MAX_TURNS:
+            termprint("error", f"Reached max turns ({DEFAULT_MAX_TURNS}); aborting run.")
+            break
+        tools = [
+            tool.describe()
+            for tool in visible_tools
+            if turn_call_register.get(tool.name, 0) < tool.max_calls_per_turn()
+        ]
         body = json.dumps({"model": model, "messages": messages, "tools": tools, "stream": True})
         start_time = time.monotonic()
         
@@ -1339,31 +1516,91 @@ def main():
 
         content_chunks = [] # we collect the content to use them in the fullfillment test
         stream_writer = _LinePrefixWriter(sys.stdout)
-        tool_requests = process_response(resp, stream_writer, content_collector=content_chunks)
+        tool_requests = process_response(resp, stream_writer, tool_registry=visible_tool_registry, content_collector=content_chunks)
         resp.close()
 
         if tool_requests:
+            filtered_requests = []
+            hidden_dropped = 0
+            coerced_hidden = 0
+            sole_visible_tool = next(iter(visible_tool_names)) if len(visible_tool_names) == 1 else None
+            for req in tool_requests:
+                req_name = req.get("name") or "bash"
+                normalized = TOOL_REGISTRY.get(req_name, TOOL_REGISTRY["bash"]).name
+                if normalized not in visible_tool_names:
+                    if sole_visible_tool is not None:
+                        coerced = dict(req)
+                        coerced["name"] = sole_visible_tool
+                        filtered_requests.append(coerced)
+                        coerced_hidden += 1
+                        continue
+                    hidden_dropped += 1
+                    continue
+                filtered_requests.append(req)
+            if coerced_hidden:
+                termprint("subitem", f"Coerced {coerced_hidden} hidden call(s) to visible tool: {sole_visible_tool}")
+            if hidden_dropped:
+                termprint("subitem", f"Dropped {hidden_dropped} call(s) to hidden tools.")
+            if not filtered_requests:
+                termprint("subitem", "Only hidden tools were requested; retrying with current tool visibility.")
+                continue
+
+            allowed_calls, dropped = _apply_tool_call_budgets(filtered_requests, turn_call_register)
+            if dropped:
+                for tool_name, count in sorted(dropped.items()):
+                    termprint("subitem", f"Dropped {count} over-budget call(s) for tool: {tool_name}")
+
+            if not allowed_calls:
+                termprint("subitem", "All requested tools are over budget for this turn; retrying with reduced tool visibility.")
+                continue
+
             tool_calls = []
-            for tool_request in tool_requests:
+            for plan in allowed_calls:
+                tool_request = plan["tool_request"]
                 tool_name = tool_request.get("name")
+                call_id = tool_request.get("id")
+                if not call_id:
+                    synthetic_call_seq += 1
+                    call_id = f"opx_call_{synthetic_call_seq}"
+                plan["resolved_call_id"] = call_id
                 tool_calls.append(
                     {
-                        "id": tool_request.get("id") or "call_1",
+                        "id": call_id,
                         "type": "function",
                         "function": {"name": tool_name, "arguments": tool_request.get("arguments", "")},
                     }
                 )
             messages.append({"role": "assistant", "tool_calls": tool_calls})
-            for tool_request in tool_requests:
-                tool_name = tool_request.get("name") or "bash"
-                tool = TOOL_REGISTRY.get(tool_name, TOOL_REGISTRY["bash"])
-                termprint("subitem", _format_tool_request(tool_request), title=f"Tool call: {tool_name}", elapsed=0.0)
+            for tool_name, count in sorted(turn_call_register.items()):
+                tool_limit = TOOL_REGISTRY.get(tool_name, TOOL_REGISTRY["bash"]).max_calls_per_turn()
+                termprint("subitem", f"Tool budget usage this turn: {tool_name} {count}/{tool_limit}")
+            for plan in allowed_calls:
+                tool_request = plan["tool_request"]
+                tool = plan["tool"]
+                tool_name = tool.name
+                termprint("subitem", _format_tool_request(tool_request), title=f"Tool call: {tool_name}")
                 tool_start = time.monotonic()
-                tool_result = tool.handle_request(tool_request)
+                try:
+                    tool_result = tool.handle_request(tool_request)
+                except Exception as exc:
+                    tool_result = {
+                        "tool": tool_name,
+                        "ok": False,
+                        "exit_code": 1,
+                        "stdout": "",
+                        "stderr": f"Tool execution failed: {exc}",
+                        "data": {"exception_type": exc.__class__.__name__},
+                            "message": "Tool execution failed",
+                        }
                 tool_elapsed = time.monotonic() - tool_start
-                termprint("box", _format_tool_result(tool_result), title="Tool result", elapsed=tool_elapsed)
+                elapsed_override = None
+                if isinstance(tool_result, dict):
+                    data = tool_result.get("data")
+                    if isinstance(data, dict):
+                        elapsed_override = data.get("elapsed_exec_sec")
+                termprint("box", _format_tool_result(tool_result), title="Tool result", elapsed=elapsed_override if isinstance(elapsed_override, (int, float)) else tool_elapsed)
                 tool_msg = {"role": "tool", "content": json.dumps(tool_result)}
-                if tool_request.get("id"): tool_msg["tool_call_id"] = tool_request.get("id")
+                tool_msg["tool_call_id"] = plan["resolved_call_id"]
                 messages.append(tool_msg)
             continue
         assistant_elapsed = time.monotonic() - start_time
@@ -1372,6 +1609,7 @@ def main():
             sys.stdout.write("\n")
             sys.stdout.flush()
         messages.append({"role": "assistant", "content": assistant_content})
+        turn_call_register = {}
         
         # test if task is fullfilled
         termprint("paragraph", "\n")
